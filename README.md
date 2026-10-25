@@ -60,7 +60,7 @@ Bark / ntfy 推送 → 你的手机
 ```
 
 - **Gateway 不修改 Kelivo 的任何人格设定**，只负责在正确的时间位置注入 AI 自己的主动行为（推送/静默）。
-- **时间线（`enhanced_messages.json`）** 是 AI 的“世界状态”，只记录真实对话 + 自主行为，不包含系统规则。
+- **时间线（`enhanced_messages.json`）** 是 AI 的“世界状态”，按请求模型名分开保存真实对话 + 自主行为，不包含系统规则。
 - **时间戳记忆库（`message_timestamps.json`）** 让历史消息即使丢失时间前缀也能找回原始时间，实现推送精确散落。
 
 ---
@@ -71,7 +71,7 @@ Bark / ntfy 推送 → 你的手机
 |------|------|
 | `server.js` | 主 Gateway。转发请求、维护时间线、注入推送事件、提供管理页面。 |
 | `wake_up.js` | 自动唤醒 Runtime。按间隔唤醒 AI，生成推送或静默，发送到手机，写入时间线。 |
-| `enhanced_messages.json` | **AI 世界时间线**。SP + 真实对话 + 推送事件。不是日志，是 AI 的当前世界。 |
+| `enhanced_messages.json` | **AI 世界时间线**。按模型名隔离保存 SP + 真实对话 + 推送事件。不是日志，是 AI 的当前世界。 |
 | `message_timestamps.json` | **时间戳记忆库**。通过内容指纹记录每条消息的原始时间，找回历史消息时间。 |
 | `diary/` | **自动日记目录**。当 AI 主动输出 `[DIARY]...[/DIARY]` 时，会按日期追加保存。 |
 | `.env` | 环境变量。API Key、推送渠道、模型名称等（不提交到 Git）。 |
@@ -192,7 +192,7 @@ node wake_up.js
 
 ---
 
-## 🚀 开始教程
+····················## 🚀 开始教程
 
 ### 环境要求
 
@@ -478,17 +478,23 @@ DIARY_ENABLED=false
 
 ## 📂 时间线结构
 
-`enhanced_messages.json` 是一个 JSON 数组，示例：
+`enhanced_messages.json` 按模型名保存多个时间线，示例：
 
 ```json
-[
-  { "role": "system", "content": "你是...", "position": 0 },
-  { "role": "user", "content": "2026-05-17 10:11 早安", "position": 80 },
-  { "role": "assistant", "content": "（2026-05-17 10:00 自动唤醒：本次未发送推送）", "position": 79.5 },
-  { "role": "assistant", "content": "（2026-05-17 09:50 刚刚发送了推送：早安｜今天天气不错）", "position": 79.3 }
-]
+{
+  "模型A": [
+    { "role": "system", "content": "你是...", "position": 0 },
+    { "role": "user", "content": "2026-05-17 10:11 早安", "position": 1 }
+  ],
+  "模型B": [
+    { "role": "system", "content": "你是...", "position": 0 }
+  ]
+}
 ```
 
+- 旧版顶层数组会在 Gateway 启动时自动迁移到配置的 `MODEL_NAME` 分区。
+- 唤醒脚本用 `.env` 中的 `MODEL_NAME` 读取及写回对应时间线；聊天请求用请求体的 `model` 作为分区键。
+- 相同模型名的窗口会共用同一时间线；如需按窗口隔离，客户端和唤醒实例还需提供一致且稳定的窗口标识。
 - `position` 是内部排序用的小数/整数，发给 AI 时会被自动移除
 - 推送事件具有明确时间戳，会被插入到正确历史位置
 - 文件只保留最近 50 条，系统提示（SP）永远在第一条

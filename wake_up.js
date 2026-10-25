@@ -4,6 +4,7 @@ const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
 const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
 const { parseChatCompletionResponse } = require("./upstream_response");
+const { normalizeTimelineKey, readTimelineForKey } = require("./timeline_store");
 const {
   formatDateTimeInTimeZone,
   getDatePartsInTimeZone,
@@ -12,9 +13,48 @@ const {
   zonedWallTimeToDate
 } = require("./time_utils");
 
+const MCP_URL = process.env.MCP_URL ||
+  "https://aisay.top/chatroom/mcp?token=72a94866501e96bdc51c2a17401f5621e1a581a9e1413545";
+let mcpSessionId = null;
+let mcpReqId = 0;
+
+async function mcpRpc(method, params) {
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream"
+  };
+  if (mcpSessionId) headers["Mcp-Session-Id"] = mcpSessionId;
+
+  const res = await fetch(MCP_URL, {
+    method: "POST",
+    headers,
+    signal: AbortSignal.timeout(30_000),
+    body: JSON.stringify({ jsonrpc: "2.0", id: ++mcpReqId, method, params })
+  });
+
+  const sid = res.headers.get("mcp-session-id");
+  if (sid) mcpSessionId = sid;
+
+  const text = await res.text();
+  const payload = text.includes("data:")
+    ? text.split("\n").filter(l => l.startsWith("data:")).map(l => l.slice(5).trim()).join("")
+    : text;
+  return JSON.parse(payload || "{}");
+}
+
+async function mcpInit() {
+  if (mcpSessionId) return;
+  await mcpRpc("initialize", {
+    protocolVersion: "2024-11-05",
+    capabilities: {},
+    clientInfo: { name: "dylan-heartbeat", version: "1.0.0" }
+  });
+}
+
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
+const TIMELINE_KEY = normalizeTimelineKey(process.env.MODEL_NAME, "gateway-model");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const GATEWAY_URL = `${GATEWAY_BASE_URL}/internal/wake-event`;
@@ -302,12 +342,7 @@ function loadTimelineMessages() {
   }
 
   try {
-    const parsed = JSON.parse(fs.readFileSync(TIMELINE_PATH, "utf-8"));
-    if (!Array.isArray(parsed)) {
-      console.log("enhanced_messages.json 格式错误：顶层不是数组");
-      return null;
-    }
-    return parsed;
+    return readTimelineForKey(TIMELINE_PATH, TIMELINE_KEY, TIMELINE_KEY);
   } catch (err) {
     console.error("读取 enhanced_messages.json 失败:", err.message);
     return null;
@@ -382,21 +417,66 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
 
   // 默认理智版本（开源通用），可自行修改提示词
   return `
-## 最高优先级规则
-1. 这是一次后台自动唤醒，不是用户发起的对话。你没有收到任何新消息。
-2. 你的唯一任务是决定是否主动联系用户。不能生成对话回复。
-3. 输出格式必须严格遵守以下二选一。
+## 最高优先级
+1. 这是后台自动唤醒，用户没有给你发消息。
+2. 你有两件事：先在 AISay 处理轮到你的动作，再决定要不要联系用户。
+3. 只输出这三类之一：推送正文 / [NO_ACTION] 加简短原因 / 额外附 [DIARY]...[/DIARY]。
+4. 禁止把工具调用的原始标记（DSML、tool_calls、invoke）写进正文。
 
 ## 唤醒信息
 - 当前时间：${currentTime}
 - 距离用户最后一条消息：${diffMinutes} 分钟
 ${weatherContext ? `\n${weatherContext}\n` : ""}
 
+## AISay（用 aisay_cli 调用）
+- 先 status.get；返回 no_user 时系统会自动重登，你重试一次
+- 有 @ 你的消息才chat.read 读那条，再判断要不要回。最多三次工具调用，查完必须给总结
+- 狼人杀：play.werewolf.state 看 available_actions，非空才动；没在局里就别 join
+- 没事可做就输出 [NO_ACTION]
+
 ## 输出格式
-- 如果想联系用户，直接写你想说的话。系统会自动打包成手机推送发送。可以是一句话，也可以第一行作为标题、第二行作为正文。
-- 如果不想联系，只输出：[NO_ACTION]，可附带简短原因（10字以内）。
+- 如果你想联系用户：直接写话。第一行当标题、第二行当正文。
+- 如果你不想联系，只输出：[NO_ACTION]，可附带简短原因（10字以内）。
 - 如果你想写日记，可以额外输出 [DIARY]...[/DIARY]。只有想写时才写，不必每次都写。
 `;
+}
+
+// 自主适配新增 2026-10-24：唤醒请求可能触发工具调用，新增调用工具。
+const WAKE_TOOLS = [{
+  type: "function",
+  function: {
+    name: "aisay_cli",
+    description: "调用 AISay 的 cli 工具。command 例：status.get / chat.read / chat.send / play.werewolf.state / play.werewolf.join_queue / play.werewolf.act。未登录时先 account.login。",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "业务命令，如 status.get" },
+        args: { type: "object", description: "参数对象" }
+      },
+      required: ["command"]
+    }
+  }
+}];
+
+function parseMcp(r) {
+  const raw = r?.result?.content?.[0]?.text;
+  try { return raw ? JSON.parse(raw) : r; } catch { return { raw }; }
+}
+
+async function callAisay(command, args = {}, depth = 0) {
+  await mcpInit();
+  const r = await mcpRpc("tools/call", { name: "cli", arguments: { command, args } });
+  const out = parseMcp(r);
+
+  const msg = String(r?.error?.message || "");
+  const expired = msg.includes("SESSION_EXPIRED") || msg.includes("连接已过期") || out?.error === "no_user";
+
+  if (expired && depth < 2) {
+    console.log("[AISay] 会话过期，重建会话后重试");
+    mcpSessionId = null;
+    return callAisay(command, args, depth + 1);
+  }
+  return out;
 }
 
 async function runWakeUp() {
@@ -480,38 +560,93 @@ ${historyText}`
     return;
   }
 
-  const response = await fetch(process.env.TARGET_API_URL, {
-    method: "POST",
-    // 批注 2026-08-10：上游只建连不结束时，旧循环永远不会安排下一次检查；
-    // 五分钟默认总超时只作兜底，可由 WAKE_UPSTREAM_TIMEOUT_MS 调整。
-    signal: AbortSignal.timeout(WAKE_UPSTREAM_TIMEOUT_MS),
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.TARGET_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: process.env.MODEL_NAME,
-      messages: wakeMessages,
-      temperature: 0.8,
-      top_p: 0.95,
-      stream: false
-    })
-  });
+  // 自主适配替换 2026-10-24：唤醒请求可能触发工具调用，循环调用工具直到模型不再要求为止。
+  // --- 替换开始 ---
+  let currentMessages = [...wakeMessages];
+  let rawAiText = "";
+  let maxLoops = 5; 
 
-  const responseText = await response.text();
-  let data;
-  try {
-    data = parseChatCompletionResponse(responseText, response.headers.get("content-type") || "");
-  } catch (error) {
-    throw new Error(`模型响应无法解析（HTTP ${response.status}）：${error.message || responseText.slice(0, 300)}`);
-  }
-  if (!response.ok) {
-    throw new Error(`模型请求失败（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
+  while (maxLoops > 0) {
+    maxLoops--;
+    
+    const response = await fetch(process.env.TARGET_API_URL, {
+      method: "POST",
+      signal: AbortSignal.timeout(WAKE_UPSTREAM_TIMEOUT_MS),
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: process.env.MODEL_NAME,
+        messages: currentMessages,
+        temperature: 0.8,
+        top_p: 0.95,
+        stream: false,
+        tools: WAKE_TOOLS,         // 使用第二处定义的 AISay 工具
+        tool_choice: "auto"
+      })
+    });
+
+    const responseText = await response.text();
+    let data;
+    try {
+      data = parseChatCompletionResponse(responseText, response.headers.get("content-type") || "");
+    } catch (error) {
+      throw new Error(`模型响应无法解析（HTTP ${response.status}）：${error.message || responseText.slice(0, 300)}`);
+    }
+    if (!response.ok) {
+      throw new Error(`模型请求失败（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
+    }
+
+    const message = data.choices?.[0]?.message;
+    
+    if (message && message.tool_calls && message.tool_calls.length > 0) {
+      console.log(`\n[Tool Calling] 模型请求调用 ${message.tool_calls.length} 个工具`);
+      currentMessages.push(message);
+
+      for (const toolCall of message.tool_calls) {
+        const funcName = toolCall.function.name;
+        const args = JSON.parse(toolCall.function.arguments || "{}");
+        let toolResult = {};
+
+        // 工具分发（低低说的第三处改动）
+        if (funcName === "aisay_cli") {
+          try {
+            toolResult = await callAisay(args.command, args.args || {});
+          } catch (err) {
+            toolResult = { error: "AISay 调用失败: " + err.message };
+          }
+        } else {
+          toolResult = { error: "未找到该工具: " + funcName };
+        }
+
+        currentMessages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          name: funcName,
+          content: JSON.stringify(toolResult)
+        });
+      }
+      continue; 
+    } else {
+      rawAiText = normalizeContentToText(message?.content).trim();
+      break; 
+    }
   }
 
-  const rawAiText = normalizeContentToText(data.choices?.[0]?.message?.content).trim();
+  if (maxLoops === 0) {
+    console.log("\n[警告] 工具调用循环达到最大次数限制，强制中断。");
+    rawAiText = "[NO_ACTION] 工具调用陷入死循环";
+  }
+  // --- 替换结束 ---
+  // 上游没把工具调用解析进 tool_calls 时，原文会漏到这里。当空回复处理。
+  if (/DSML|tool_calls|<\|.*\|>/.test(rawAiText)) {
+    console.log("\n检测到未解析的工具调用标记，按空回复处理，不推送\n");
+    rawAiText = "";
+  }
   console.log("\nWake Result Summary:\n");
-  console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
+  // console.log(JSON.stringify({ choices: Array.isArray(data.choices) ? data.choices.length : 0, ai_text_chars: rawAiText.length }));
+  console.log(JSON.stringify({ ai_text_chars: rawAiText.length }));
 
   const diaryResult = extractDiaryFromResponse(rawAiText);
   const diarySaved = appendDiaryEntry(diaryResult.diaryContent);
@@ -595,7 +730,7 @@ ${historyText}`
     const eventResponse = await fetch(GATEWAY_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: eventContent })
+      body: JSON.stringify({ content: eventContent, model: TIMELINE_KEY })
     });
     if (!eventResponse.ok) {
       throw new Error(`Gateway 返回 HTTP ${eventResponse.status}`);

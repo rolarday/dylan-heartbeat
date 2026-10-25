@@ -17,6 +17,12 @@ const {
   resolveTimeZone,
   zonedWallTimeToDate
 } = require("./time_utils");
+const {
+  migrateLegacyTimelineStore,
+  normalizeTimelineKey,
+  readTimelineForKey,
+  writeTimelineForKey
+} = require("./timeline_store");
 
 const DEFAULT_BODY_LIMIT_MB = 50;
 
@@ -212,20 +218,28 @@ function safeJsonForInlineScript(value) {
 // ========================
 // 读取 timeline
 // ========================
-function loadTimeline() {
-  if (!fs.existsSync(TIMELINE_FILE)) return [];
-  try { return fs.readJsonSync(TIMELINE_FILE); } catch { return []; }
+function loadTimeline(timelineKey = configuredModelName()) {
+  return readTimelineForKey(TIMELINE_FILE, timelineKey, configuredModelName());
 }
 
 // ========================
 // 保存 timeline（保留 SP）
 // ========================
-function saveTimeline(messages) {
+function saveTimeline(messages, timelineKey = configuredModelName()) {
   const sp = messages.find(m => m.role === "system");
   const nonSP = messages.filter(m => m.role !== "system");
   const trimmed = nonSP.slice(-49);
   const final = sp ? [sp, ...trimmed] : trimmed;
-  writeJsonAtomicSync(TIMELINE_FILE, final);
+  const sanitized = final.map(message => {
+    const sanitizedMessage = { ...message };
+    delete sanitizedMessage.reasoning_content;
+    return sanitizedMessage;
+  });
+  writeTimelineForKey(TIMELINE_FILE, timelineKey, sanitized, configuredModelName());
+}
+
+if (migrateLegacyTimelineStore(TIMELINE_FILE, configuredModelName())) {
+  console.log(`已将旧版单一时间线迁移到模型分区：${configuredModelName()}`);
 }
 
 // ========================
@@ -314,8 +328,8 @@ function isSystemRule(msg) {
 // ========================
 // 构建 Timeline
 // ========================
-function buildTimeline(kelivoMessages, tsDB) {
-  const oldTimeline = loadTimeline();
+function buildTimeline(kelivoMessages, tsDB, timelineKey) {
+  const oldTimeline = loadTimeline(timelineKey);
   const newSystemMessages = kelivoMessages
     .filter(msg => msg.role === "system")
     .map(normalizeMessageForTimeline);
@@ -394,15 +408,15 @@ function buildTimeline(kelivoMessages, tsDB) {
 // ========================
 // 追加特殊事件
 // ========================
-function appendSpecialEvent(content) {
-  const timeline = loadTimeline();
+function appendSpecialEvent(content, timelineKey = configuredModelName()) {
+  const timeline = loadTimeline(timelineKey);
   let maxPos = 0;
   for (const msg of timeline) {
     if (msg.position && msg.position > maxPos) maxPos = msg.position;
   }
   const newEvent = { role: "assistant", content, position: maxPos + 0.5 };
   timeline.push(newEvent);
-  saveTimeline(timeline);
+  saveTimeline(timeline, timelineKey);
   // 批注 2026-07-15：特殊事件可能包含推送正文；日志只记录长度，避免公开部署时泄漏私密内容。
   console.log(`\n已记录特殊事件 (position ${newEvent.position}, chars ${normalizeContentToText(content).length})\n`);
 }
@@ -556,6 +570,7 @@ app.get("/v1/models", async (req, reply) => {
 // Chat Completions
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
+  console.log("收到的请求体:", JSON.stringify(req.body, null, 2));
   try {
     const body = req.body;
     // 批注 2026-07-15：公开部署时日志不能默认写入完整上下文；
@@ -568,7 +583,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }));
 
     const kelivoMessages = body.messages || [];
-    const oldTimeline = loadTimeline();
+    const timelineKey = normalizeTimelineKey(body?.model, configuredModelName());
+    const oldTimeline = loadTimeline(timelineKey);
 
     const tsDB = loadTimestampDB();
     let tsDBDirty = false;
@@ -584,8 +600,8 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }
     if (tsDBDirty) saveTimestampDB(tsDB);
 
-    const finalTimeline = buildTimeline(kelivoMessages, tsDB);
-    saveTimeline(finalTimeline);
+    const finalTimeline = buildTimeline(kelivoMessages, tsDB, timelineKey);
+    saveTimeline(finalTimeline, timelineKey);
 
     // Kelivo 发图时 content 常是数组。默认原样透传给视觉模型；
     // 如上游不支持图片，可设置 MULTIMODAL_MODE=text 退回文本占位。
@@ -742,15 +758,14 @@ app.post("/v1/chat/completions", async (req, reply) => {
     reply.code(500).send({ error: err.message });
   }
 });
-
 // ========================
 // 内部接口：记录唤醒事件
 // ========================
 app.post("/internal/wake-event", async (req, reply) => {
   try {
-    const { content } = req.body;
+    const { content, model } = req.body || {};
     if (!content) return reply.code(400).send({ error: "content is required" });
-    appendSpecialEvent(content);
+    appendSpecialEvent(content, normalizeTimelineKey(model, configuredModelName()));
     reply.send({ success: true });
   } catch (err) {
     console.error(err);
