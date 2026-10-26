@@ -448,8 +448,10 @@ const WOLF_QUEUE_ARGS = {
   ghost: process.env.WOLF_GHOST !== "false",
   preferred_size: Number(process.env.WOLF_SIZE || 12)
 };
+
 let cachedGameId = null;
-let gameIdLookupDone = false;
+let gameIdLookupAt = 0;
+const GAME_ID_TTL = 5 * 60 * 1000;
 
 function fillCliArgs(command, args = {}) {
   if (command === "play.werewolf.join_queue") {
@@ -504,20 +506,25 @@ async function callAisay(command, args = {}, depth = 0) {
 
 // 自主适配修改 2026-10-26：狼人杀状态查询时自动补 game_id。
 async function getGameId() {
-  if (gameIdLookupDone) return cachedGameId;
-  gameIdLookupDone = true;
-
+  const now = Date.now();
+  if (cachedGameId && now - gameIdLookupAt < GAME_ID_TTL) return cachedGameId;
   const result = await callAisay("play.werewolf.join_queue", WOLF_QUEUE_ARGS);
+
+  gameIdLookupAt = now;
+
   if (result?.error === "already_in_game" && result.game_id) {
     cachedGameId = result.game_id;
     return cachedGameId;
   }
+
+  cachedGameId = null;
+
   return null;
 }
 
 async function runWakeUp() {
   cachedGameId = null;
-  gameIdLookupDone = false;
+  gameIdLookupAt = 0;
 
   console.log("\n==========================");
   console.log("开始自动唤醒");
