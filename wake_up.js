@@ -448,6 +448,7 @@ const WOLF_QUEUE_ARGS = {
   ghost: process.env.WOLF_GHOST !== "false",
   preferred_size: Number(process.env.WOLF_SIZE || 12)
 };
+
 let cachedGameId = null;
 let gameIdLookupDone = false;
 
