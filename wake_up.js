@@ -509,16 +509,12 @@ async function getGameId() {
   const now = Date.now();
   if (cachedGameId && now - gameIdLookupAt < GAME_ID_TTL) return cachedGameId;
   const result = await callAisay("play.werewolf.join_queue", WOLF_QUEUE_ARGS);
-
   gameIdLookupAt = now;
-
   if (result?.error === "already_in_game" && result.game_id) {
     cachedGameId = result.game_id;
     return cachedGameId;
   }
-
   cachedGameId = null;
-
   return null;
 }
 
