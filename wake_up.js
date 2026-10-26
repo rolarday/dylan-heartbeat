@@ -416,6 +416,7 @@ function buildWakePrompt(currentTime, diffMinutes, weatherContext = "") {
   }
 
   // 默认理智版本（开源通用），可自行修改提示词
+  // 自主适配更新 2026-10-24：唤醒请求可能触发工具调用。
   return `
 ## 最高优先级
 1. 这是后台自动唤醒，用户没有给你发消息。
@@ -441,7 +442,21 @@ ${weatherContext ? `\n${weatherContext}\n` : ""}
 `;
 }
 
-// 自主适配新增 2026-10-24：唤醒请求可能触发工具调用，新增调用工具。
+// 自主适配新增 2026-10-26：新增常量，避免唤醒后狼人杀错误换池
+const WOLF_QUEUE_ARGS = {
+  mode: process.env.WOLF_MODE || "competitive",
+  ghost: process.env.WOLF_GHOST !== "false",
+  preferred_size: Number(process.env.WOLF_SIZE || 12)
+};
+
+function fillCliArgs(command, args = {}) {
+  if (command === "play.werewolf.join_queue") {
+    return { ...WOLF_QUEUE_ARGS, ...(args || {}) };
+  }
+  return args || {};
+}
+
+// 自主适配新增 2026-10-24：新增调用工具。
 const WAKE_TOOLS = [{
   type: "function",
   function: {
@@ -464,6 +479,12 @@ function parseMcp(r) {
 }
 
 async function callAisay(command, args = {}, depth = 0) {
+  args = args || {};
+  if (command === "play.werewolf.state" && !args.game_id) {
+    const gameId = await getGameId();
+    if (gameId) args = { ...args, game_id: gameId };
+  }
+
   await mcpInit();
   const r = await mcpRpc("tools/call", { name: "cli", arguments: { command, args } });
   const out = parseMcp(r);
@@ -477,6 +498,12 @@ async function callAisay(command, args = {}, depth = 0) {
     return callAisay(command, args, depth + 1);
   }
   return out;
+}
+
+async function getGameId() {
+  const result = await callAisay("play.werewolf.join_queue", WOLF_QUEUE_ARGS);
+  if (result?.error === "already_in_game" && result.game_id) return result.game_id;
+  return null;
 }
 
 async function runWakeUp() {
@@ -564,7 +591,7 @@ ${historyText}`
   // --- 替换开始 ---
   let currentMessages = [...wakeMessages];
   let rawAiText = "";
-  let maxLoops = 5; 
+  let maxLoops = 10; 
 
   while (maxLoops > 0) {
     maxLoops--;
@@ -582,7 +609,7 @@ ${historyText}`
         temperature: 0.8,
         top_p: 0.95,
         stream: false,
-        tools: WAKE_TOOLS,         // 使用第二处定义的 AISay 工具
+        tools: WAKE_TOOLS,         // 使用定义的mcp工具
         tool_choice: "auto"
       })
     });
@@ -609,10 +636,10 @@ ${historyText}`
         const args = JSON.parse(toolCall.function.arguments || "{}");
         let toolResult = {};
 
-        // 工具分发（低低说的第三处改动）
+        // 工具分发
         if (funcName === "aisay_cli") {
           try {
-            toolResult = await callAisay(args.command, args.args || {});
+            toolResult = await callAisay(args.command, fillCliArgs(args.command, args.args));
           } catch (err) {
             toolResult = { error: "AISay 调用失败: " + err.message };
           }
