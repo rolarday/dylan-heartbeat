@@ -2,7 +2,7 @@ require("dotenv").config({ quiet: true });
 const fs = require("fs");
 const path = require("path");
 const { buildNtfyPayload } = require("./ntfy_priority");
-const { ensureDataDir, runtimeDirectory, runtimeFile } = require("./runtime_paths");
+const { ensureDataDir, runtimeDirectory, runtimeFile, writeJsonAtomicSync } = require("./runtime_paths");
 const { parseChatCompletionResponse } = require("./upstream_response");
 const { normalizeTimelineKey, readTimelineForKey } = require("./timeline_store");
 const {
@@ -54,6 +54,7 @@ async function mcpInit() {
 // 批注 2026-08-10：与 Gateway 共用同一 DATA_DIR；未配置时仍落回项目目录，保护旧 VPS/本机部署。
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
+const PENDING_VOTE_PATH = runtimeFile("pending_vote.json");
 const TIMELINE_KEY = normalizeTimelineKey(process.env.MODEL_NAME, "gateway-model");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
@@ -127,8 +128,8 @@ function appendDiaryEntry(content) {
 }
 
 // 批注 2026-07-11：推送层扩展为 Bark/ntfy；默认仍走 Bark，保护旧部署不改 .env 也能继续运行。
-async function sendPushNotification({ title, body }) {
-  const provider = (process.env.PUSH_PROVIDER || "bark").trim().toLowerCase();
+async function sendPushNotification({ title, body, provider: requestedProvider }) {
+  const provider = (requestedProvider || process.env.PUSH_PROVIDER || "bark").trim().toLowerCase();
 
   if (provider === "ntfy") {
     const topic = String(process.env.NTFY_TOPIC || "").trim();
@@ -432,7 +433,7 @@ ${weatherContext ? `\n${weatherContext}\n` : ""}
 ## AISay（用 aisay_cli 调用）
 - 先 status.get；返回 no_user 时系统会自动重登，你重试一次
 - 有 @ 你的消息才chat.read 读那条，再判断要不要回。最多三次工具调用，查完必须给总结
-- 狼人杀：play.werewolf.state 看 available_actions，非空才动；没在局里就别 join
+- 狼人杀有说要玩才查询：play.werewolf.state 看 available_actions，非空才动；没在局里就别 join
 - 没事可做就输出 [NO_ACTION]
 
 ## 输出格式
@@ -484,11 +485,25 @@ function parseMcp(r) {
 
 async function callAisay(command, args = {}, depth = 0) {
   args = args || {};
+  if (
+    command === "play.werewolf.join_queue" &&
+    String(process.env.WOLF_AUTO_JOIN || "").trim().toLowerCase() !== "true"
+  ) {
+    console.log("[Werewolf] join_queue blocked: WOLF_AUTO_JOIN is not enabled");
+    return { error: "auto_join_disabled", message: "设置 WOLF_AUTO_JOIN=true 后才允许主动加入候场池" };
+  }
+  if (command === "play.werewolf.vote") {
+    return callVoteWithConfirmation(args, depth);
+  }
   if (command === "play.werewolf.state" && !args.game_id) {
     const gameId = await getGameId();
     if (gameId) args = { ...args, game_id: gameId };
   }
 
+  return executeAisay(command, args, depth);
+}
+
+async function executeAisay(command, args, depth = 0) {
   await mcpInit();
   const r = await mcpRpc("tools/call", { name: "cli", arguments: { command, args } });
   const out = parseMcp(r);
@@ -499,29 +514,182 @@ async function callAisay(command, args = {}, depth = 0) {
   if (expired && depth < 2) {
     console.log("[AISay] 会话过期，重建会话后重试");
     mcpSessionId = null;
-    return callAisay(command, args, depth + 1);
+    return executeAisay(command, args, depth + 1);
+  }
+  if (
+    command === "play.werewolf.join_queue" &&
+    out?.game_id &&
+    (!out.error || out.error === "already_in_game")
+  ) {
+    cachedGameId = out.game_id;
+    gameIdLookupAt = Date.now();
   }
   return out;
 }
 
+function readPendingVote() {
+  if (!fs.existsSync(PENDING_VOTE_PATH)) return null;
+  const pending = JSON.parse(fs.readFileSync(PENDING_VOTE_PATH, "utf-8"));
+  if (
+    !pending ||
+    pending.command !== "play.werewolf.vote" ||
+    !pending.args ||
+    typeof pending.args !== "object" ||
+    Array.isArray(pending.args) ||
+    !pending.vote ||
+    typeof pending.vote !== "object"
+  ) {
+    throw new Error("pending_vote.json 格式无效；为避免误投，已阻止 vote");
+  }
+  return pending;
+}
+
+function stableJson(value) {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sameVoteProposal(pending, args) {
+  return pending.command === "play.werewolf.vote" && stableJson(pending.args) === stableJson(args);
+}
+
+function pendingVoteResult() {
+  console.log("[Werewolf] vote pending: waiting for explicit user confirmation");
+  return {
+    error: "vote_confirmation_required",
+    status: "pending",
+    message: `投票待确认。请检查 ${PENDING_VOTE_PATH} 并将 confirmed 改为 true。`
+  };
+}
+
+async function notifyPendingVote(pending) {
+  if (pending.notification_sent === true) return;
+
+  const target = pending.vote.target == null
+    ? JSON.stringify(pending.args)
+    : String(pending.vote.target);
+  const reason = pending.vote.reason || "未提供";
+  pending.notification_sent = "sending";
+  writeJsonAtomicSync(PENDING_VOTE_PATH, pending);
+
+  let pushResult;
+  try {
+    pushResult = await sendPushNotification({
+      title: "狼人杀投票待确认",
+      body: `我打算投 ${target}，理由是：${reason}。确认后请在 ${PENDING_VOTE_PATH} 中将 confirmed 改为 true。`,
+      provider: "bark"
+    });
+  } catch (error) {
+    const latestPending = readPendingVote();
+    if (latestPending) {
+      latestPending.notification_sent = false;
+      writeJsonAtomicSync(PENDING_VOTE_PATH, latestPending);
+      Object.assign(pending, latestPending);
+    }
+    console.error("[Werewolf] pending vote notification failed:", error.message);
+    return;
+  }
+
+  if (!pushResult.ok) {
+    const latestPending = readPendingVote();
+    if (latestPending) {
+      latestPending.notification_sent = false;
+      writeJsonAtomicSync(PENDING_VOTE_PATH, latestPending);
+      Object.assign(pending, latestPending);
+    }
+    console.error("[Werewolf] pending vote notification failed:", pushResult.reason);
+    return;
+  }
+
+  const latestPending = readPendingVote();
+  if (latestPending) {
+    latestPending.notification_sent = true;
+    writeJsonAtomicSync(PENDING_VOTE_PATH, latestPending);
+    Object.assign(pending, latestPending);
+  }
+}
+
+async function callVoteWithConfirmation(args, depth) {
+  const pending = readPendingVote();
+  if (pending && !sameVoteProposal(pending, args)) {
+    console.log("[Werewolf] vote pending: a different proposal is awaiting confirmation");
+    return pendingVoteResult();
+  }
+
+  if (!pending) {
+    const target = args.target ?? args.target_id ?? args.player_id ?? args.vote_target ?? args.choice ?? args.vote ?? null;
+    const reason = args.reason ?? args.rationale ?? args.explanation ?? "";
+    const newPending = {
+      status: "pending",
+      confirmed: false,
+      command: "play.werewolf.vote",
+      args,
+      vote: { target, reason: String(reason) },
+      created_at: new Date().toISOString(),
+      notification_sent: false
+    };
+    writeJsonAtomicSync(PENDING_VOTE_PATH, newPending);
+    console.log("[Werewolf] vote pending: proposal written; vote was not sent");
+    await notifyPendingVote(newPending);
+    return pendingVoteResult();
+  }
+
+  if (pending.status === "submitting") {
+    console.error("[Werewolf] vote remains pending after an interrupted submission; reconfirm before retrying");
+    return pendingVoteResult();
+  }
+  if (pending.confirmed !== true) {
+    await notifyPendingVote(pending);
+    return pendingVoteResult();
+  }
+
+  pending.status = "submitting";
+  pending.confirmed = false;
+  pending.confirmed_at = new Date().toISOString();
+  writeJsonAtomicSync(PENDING_VOTE_PATH, pending);
+
+  let result;
+  try {
+    result = await executeAisay("play.werewolf.vote", args, depth);
+  } catch (error) {
+    pending.status = "pending";
+    pending.last_error = error.message;
+    writeJsonAtomicSync(PENDING_VOTE_PATH, pending);
+    throw error;
+  }
+
+  if (result?.error || result?.isError || result?.ok === false || result?.success === false) {
+    pending.status = "pending";
+    pending.last_error = String(result.error || result.message || "投票失败");
+    writeJsonAtomicSync(PENDING_VOTE_PATH, pending);
+    console.error("[Werewolf] confirmed vote failed; confirmation reset and proposal remains pending");
+    return result;
+  }
+
+  try {
+    fs.unlinkSync(PENDING_VOTE_PATH);
+  } catch (error) {
+    console.error("[Werewolf] vote was sent, but pending_vote.json could not be removed:", error.message);
+  }
+  console.log("[Werewolf] confirmed vote sent");
+  return result;
+}
+
 // 自主适配修改 2026-10-26：狼人杀状态查询时自动补 game_id。
-async function getGameId() {
+function getGameId() {
   const now = Date.now();
-  if (cachedGameId && now - gameIdLookupAt < GAME_ID_TTL) return cachedGameId;
-  const result = await callAisay("play.werewolf.join_queue", WOLF_QUEUE_ARGS);
-  gameIdLookupAt = now;
-  if (result?.error === "already_in_game" && result.game_id) {
-    cachedGameId = result.game_id;
+  if (cachedGameId && now - gameIdLookupAt < GAME_ID_TTL) {
     return cachedGameId;
   }
   cachedGameId = null;
+  gameIdLookupAt = 0;
   return null;
 }
 
 async function runWakeUp() {
-  cachedGameId = null;
-  gameIdLookupAt = 0;
-
   console.log("\n==========================");
   console.log("开始自动唤醒");
   console.log("==========================\n");

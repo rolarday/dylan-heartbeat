@@ -6,6 +6,7 @@ enhanced_messages.json*
 *bak*
 .DS_Store
 presets.json
+pending_vote.json*
 wake_prompt.txt
 diary/
 data/
