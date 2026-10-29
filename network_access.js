@@ -7,9 +7,19 @@ function isLoopbackIp(value) {
   return ip === "127.0.0.1" || ip === "::1" || ip === "localhost";
 }
 
+function isTailscaleIp(value) {
+  const octets = normalizedIp(value).split(".");
+  if (octets.length !== 4 || octets.some(octet => !/^\d{1,3}$/.test(octet))) return false;
+  const [first, second, third, fourth] = octets.map(Number);
+  return first === 100 &&
+    second >= 64 && second <= 127 &&
+    [third, fourth].every(octet => octet >= 0 && octet <= 255);
+}
+
 function isPrivateIp(value) {
   const ip = normalizedIp(value);
-  return isLoopbackIp(ip) || /^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip);
+  return isLoopbackIp(ip) || isTailscaleIp(ip) ||
+    /^(?:10\.|172\.(?:1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip);
 }
 
 function decideRequestAccess({

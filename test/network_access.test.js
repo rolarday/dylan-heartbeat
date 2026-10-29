@@ -34,6 +34,19 @@ test("preserves trusted LAN access for non-Railway deployments", () => {
   assert.equal(decide({ isRailway: false, ip: "192.168.1.20" }).allow, true);
 });
 
+test("allows Tailscale addresses to access the API on non-Railway deployments", () => {
+  assert.equal(decide({ isRailway: false, ip: "100.64.0.1" }).allow, true);
+  assert.equal(decide({ isRailway: false, ip: "100.127.255.254" }).allow, true);
+  assert.equal(decide({ isRailway: false, ip: "::ffff:100.64.0.1" }).allow, true);
+  assert.equal(decide({ isRailway: false, ip: "100.63.255.255" }).allow, false);
+  assert.equal(decide({ isRailway: false, ip: "100.128.0.1" }).allow, false);
+  assert.equal(decide({ isRailway: false, ip: "100.64.256.1" }).allow, false);
+});
+
+test("does not allow Tailscale addresses to call internal write routes", () => {
+  assert.equal(decide({ path: "/internal/wake-event", isRailway: false, ip: "100.64.0.1" }).allow, false);
+});
+
 test("lets the legacy test route reach its own admin authentication", () => {
   assert.equal(decide({ path: "/test-bark", ip: "10.0.0.8" }).allow, true);
 });
