@@ -12,6 +12,7 @@ const {
 } = require("./runtime_paths");
 const { isSpecialEventContent } = require("./special_events");
 const { decideRequestAccess } = require("./network_access");
+const { DiarySseFilter, filterCompletionResponse } = require("./diary_stream");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
@@ -52,6 +53,7 @@ const IS_RAILWAY_RUNTIME = Boolean(
 const DATA_DIR = ensureDataDir();
 const TIMELINE_FILE = runtimeFile("enhanced_messages.json");
 const TIMESTAMP_DB_FILE = runtimeFile("message_timestamps.json");
+const DIARY_DIR_PATH = runtimeDirectory(process.env.DIARY_DIR || "diary", "diary");
 // 批注 2026-07-17：管理页保存 .env 后要让 PM2 刷新进程环境；保留原进程名，
 // 只补 --update-env，避免用户改完推送配置却继续运行旧值。
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up --update-env";
@@ -66,6 +68,25 @@ function configuredModelName() {
   // 批注 2026-07-15：/v1/models 要暴露部署者实际配置的模型名；
   // 不能继续硬编码示例模型，否则 Kelivo 模型选择会和真实上游不一致。
   return String(process.env.MODEL_NAME || "gateway-model").trim() || "gateway-model";
+}
+
+function appendKelivoDiaryEntry(content) {
+  if (!readBooleanEnv("DIARY_ENABLED", true)) {
+    console.log("Kelivo 输出了日记，但 DIARY_ENABLED=false，本次不保存");
+    return false;
+  }
+
+  const cleanContent = String(content || "").trim();
+  if (!cleanContent) return false;
+
+  const timestamp = formatDateTimeInTimeZone(new Date(), TIME_ZONE);
+  const date = timestamp.slice(0, 10);
+  const diaryFile = path.join(DIARY_DIR_PATH, `${date}.kelivo.md`);
+  const entry = `\n\n## ${timestamp}\n\n${cleanContent}\n`;
+  fs.ensureDirSync(DIARY_DIR_PATH);
+  fs.appendFileSync(diaryFile, entry, "utf-8");
+  console.log(`已保存 Kelivo 日记：${diaryFile}`);
+  return true;
 }
 
 // ========================
@@ -730,10 +751,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // 批注 2026-07-11：Kelivo 关闭 stream 时需要收到普通 JSON；只在请求或上游确认为 SSE 时才按流式直通。
     if (!shouldStreamResponse) {
       const responseText = await response.text();
+      const filteredResponse = filterCompletionResponse(responseText, appendKelivoDiaryEntry);
       return reply
         .code(response.status)
         .header("Content-Type", upstreamContentType || "application/json")
-        .send(responseText);
+        .send(filteredResponse.responseText);
     }
 
     if (!response.body) {
@@ -747,14 +769,22 @@ app.post("/v1/chat/completions", async (req, reply) => {
     });
 
     const reader = response.body.getReader();
+    const diarySseFilter = new DiarySseFilter(appendKelivoDiaryEntry);
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      reply.raw.write(value);
+      const filteredChunk = diarySseFilter.push(value);
+      if (filteredChunk) reply.raw.write(filteredChunk);
     }
+    const finalChunk = diarySseFilter.finish();
+    if (finalChunk) reply.raw.write(finalChunk);
     reply.raw.end();
   } catch (err) {
     console.error(err);
+    if (reply.raw.headersSent) {
+      reply.raw.destroy(err);
+      return;
+    }
     reply.code(500).send({ error: err.message });
   }
 });

@@ -366,7 +366,13 @@ function getLocalTimeString() {
 function readLastWakeAt() {
   if (!fs.existsSync(WAKE_STATE_PATH)) return null;
 
-  const state = JSON.parse(fs.readFileSync(WAKE_STATE_PATH, "utf-8"));
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(WAKE_STATE_PATH, "utf-8"));
+  } catch {
+    console.error("[Wake] wake_state.json 解析失败，按无记录处理");
+    return null;
+  }
   if (!state?.last_wake_at) return null;
   const lastWakeAt = new Date(state.last_wake_at);
   if (Number.isNaN(lastWakeAt.getTime())) {
