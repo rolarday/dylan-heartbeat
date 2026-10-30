@@ -55,6 +55,7 @@ async function mcpInit() {
 const DATA_DIR = ensureDataDir();
 const TIMELINE_PATH = runtimeFile("enhanced_messages.json");
 const PENDING_VOTE_PATH = runtimeFile("pending_vote.json");
+const WAKE_STATE_PATH = runtimeFile("wake_state.json");
 const TIMELINE_KEY = normalizeTimelineKey(process.env.MODEL_NAME, "gateway-model");
 const PORT = Number(process.env.PORT) || 3000;
 const GATEWAY_BASE_URL = (process.env.GATEWAY_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
@@ -362,9 +363,28 @@ function getLocalTimeString() {
   return formatDateTimeInTimeZone(new Date(), TIME_ZONE);
 }
 
+function readLastWakeAt() {
+  if (!fs.existsSync(WAKE_STATE_PATH)) return null;
+
+  const state = JSON.parse(fs.readFileSync(WAKE_STATE_PATH, "utf-8"));
+  if (!state?.last_wake_at) return null;
+  const lastWakeAt = new Date(state.last_wake_at);
+  if (Number.isNaN(lastWakeAt.getTime())) {
+    throw new Error(`wake_state.json 中的 last_wake_at 无效：${state.last_wake_at}`);
+  }
+  return lastWakeAt;
+}
+
+function writeLastWakeAt(date = new Date()) {
+  writeJsonAtomicSync(WAKE_STATE_PATH, { last_wake_at: date.toISOString() });
+}
+
 function shouldWake(lastUserTime) {
   const now = getNow();
-  const diffMinutes = Math.floor((now - new Date(lastUserTime)) / 1000 / 60);
+  const userAt = new Date(lastUserTime);
+  const lastWakeAt = readLastWakeAt();
+  const baseline = lastWakeAt && lastWakeAt > userAt ? lastWakeAt : userAt;
+  const diffMinutes = Math.floor((now - baseline) / 1000 / 60);
   return diffMinutes >= getWakeAfterMinutes(now);
 }
 
@@ -710,6 +730,8 @@ async function runWakeUp() {
     console.log("\n暂不需要唤醒\n");
     return;
   }
+
+  writeLastWakeAt();
 
   const weatherContext = await fetchWeatherContext();
   const wakePrompt = buildWakePrompt(getChinaTimeString(), diffMinutes, weatherContext);
