@@ -13,46 +13,85 @@ function trailingTagPrefixLength(text, tag) {
 
 function createDiaryContentFilter(onDiary) {
   let inDiary = false;
-  let pending = "";
+  let pendingStart = "";
+  let pendingEnd = "";
   let diaryContent = "";
+  let lineStart = true;
 
   return {
     push(text) {
-      let input = pending + String(text || "");
-      pending = "";
+      let input = String(text || "");
       let visible = "";
 
       while (input) {
-        if (!inDiary) {
-          const startIndex = input.indexOf(DIARY_START_TAG);
-          if (startIndex >= 0) {
-            visible += input.slice(0, startIndex);
-            input = input.slice(startIndex + DIARY_START_TAG.length);
-            inDiary = true;
+        if (inDiary) {
+          const diaryInput = pendingEnd + input;
+          pendingEnd = "";
+          const endIndex = diaryInput.indexOf(DIARY_END_TAG);
+          if (endIndex >= 0) {
+            diaryContent += diaryInput.slice(0, endIndex);
+            onDiary(diaryContent);
             diaryContent = "";
+            input = diaryInput.slice(endIndex + DIARY_END_TAG.length);
+            inDiary = false;
+            lineStart = false;
             continue;
           }
 
-          const suffixLength = trailingTagPrefixLength(input, DIARY_START_TAG);
-          visible += suffixLength ? input.slice(0, -suffixLength) : input;
-          pending = suffixLength ? input.slice(-suffixLength) : "";
+          const suffixLength = trailingTagPrefixLength(diaryInput, DIARY_END_TAG);
+          diaryContent += suffixLength ? diaryInput.slice(0, -suffixLength) : diaryInput;
+          pendingEnd = suffixLength ? diaryInput.slice(-suffixLength) : "";
           break;
         }
 
-        const endIndex = input.indexOf(DIARY_END_TAG);
-        if (endIndex >= 0) {
-          diaryContent += input.slice(0, endIndex);
-          onDiary(diaryContent);
-          diaryContent = "";
-          input = input.slice(endIndex + DIARY_END_TAG.length);
-          inDiary = false;
+        if (pendingStart) {
+          const remainingTag = DIARY_START_TAG.slice(pendingStart.length);
+          let matchedLength = 0;
+          while (
+            matchedLength < input.length &&
+            matchedLength < remainingTag.length &&
+            input[matchedLength] === remainingTag[matchedLength]
+          ) {
+            matchedLength++;
+          }
+          pendingStart += input.slice(0, matchedLength);
+          input = input.slice(matchedLength);
+
+          if (pendingStart === DIARY_START_TAG) {
+            pendingStart = "";
+            inDiary = true;
+            diaryContent = "";
+            lineStart = false;
+            continue;
+          }
+          if (matchedLength === remainingTag.length || input.length === 0) break;
+
+          visible += pendingStart;
+          pendingStart = "";
+          lineStart = false;
           continue;
         }
 
-        const suffixLength = trailingTagPrefixLength(input, DIARY_END_TAG);
-        diaryContent += suffixLength ? input.slice(0, -suffixLength) : input;
-        pending = suffixLength ? input.slice(-suffixLength) : "";
-        break;
+        if (lineStart && input.startsWith(DIARY_START_TAG)) {
+          input = input.slice(DIARY_START_TAG.length);
+          inDiary = true;
+          diaryContent = "";
+          lineStart = false;
+          continue;
+        }
+        if (lineStart && DIARY_START_TAG.startsWith(input)) {
+          pendingStart = input;
+          break;
+        }
+
+        const character = input[0];
+        input = input.slice(1);
+        if (lineStart && character === "[") {
+          pendingStart = character;
+          continue;
+        }
+        visible += character;
+        lineStart = character === "\n" || character === "\r";
       }
 
       return visible;
@@ -63,12 +102,12 @@ function createDiaryContentFilter(onDiary) {
         diaryContent = "";
         return "";
       }
-      const visible = pending;
-      pending = "";
+      const visible = pendingStart;
+      pendingStart = "";
       return visible;
     },
     get canBypass() {
-      return !inDiary && !pending;
+      return !inDiary && !pendingStart;
     }
   };
 }

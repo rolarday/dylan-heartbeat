@@ -6,25 +6,46 @@ const {
   filterCompletionResponse
 } = require("../diary_stream");
 
-test("filters complete diary tags from visible text and saves only diary contents", () => {
+test("filters diary blocks beginning at the start of a line", () => {
   const diaries = [];
   const filter = createDiaryContentFilter(content => diaries.push(content));
 
-  const visible = filter.push("Visible [DIARY]private entry[/DIARY] tail") + filter.finish();
+  const visible = filter.push("Visible\n[DIARY]private entry[/DIARY]\ntail") + filter.finish();
 
-  assert.equal(visible, "Visible  tail");
+  assert.equal(visible, "Visible\n\ntail");
   assert.deepEqual(diaries, ["private entry"]);
 });
 
-test("keeps split start tags hidden and discards an unclosed diary", () => {
+test("filters a diary block at the beginning of the message", () => {
   const diaries = [];
   const filter = createDiaryContentFilter(content => diaries.push(content));
 
-  const visible = filter.push("Visible [DIA") +
+  const visible = filter.push("[DIARY]private entry[/DIARY]\nVisible") + filter.finish();
+
+  assert.equal(visible, "\nVisible");
+  assert.deepEqual(diaries, ["private entry"]);
+});
+
+test("does not treat an inline diary tag as a diary block", () => {
+  const diaries = [];
+  const filter = createDiaryContentFilter(content => diaries.push(content));
+  const content = "Visible [DIARY]ordinary mention[/DIARY] tail";
+
+  const visible = filter.push(content) + filter.finish();
+
+  assert.equal(visible, content);
+  assert.deepEqual(diaries, []);
+});
+
+test("keeps a split line-start tag hidden and discards an unclosed diary", () => {
+  const diaries = [];
+  const filter = createDiaryContentFilter(content => diaries.push(content));
+
+  const visible = filter.push("Visible\n[DIA") +
     filter.push("RY]private entry") +
     filter.finish();
 
-  assert.equal(visible, "Visible ");
+  assert.equal(visible, "Visible\n");
   assert.deepEqual(diaries, []);
 });
 
@@ -42,7 +63,7 @@ test("filters diary tags split between SSE events and UTF-8 byte chunks", () => 
   const diaries = [];
   const stream = new DiarySseFilter(content => diaries.push(content));
   const frames = [
-    { choices: [{ index: 0, delta: { content: "公开🙂[DIA" } }] },
+    { choices: [{ index: 0, delta: { content: "公开🙂\n[DIA" } }] },
     { choices: [{ index: 0, delta: { content: "RY]私密日记" } }] },
     { choices: [{ index: 0, delta: { content: "[/DIA" } }] },
     { choices: [{ index: 0, delta: { content: "RY]结束" } }] }
@@ -56,7 +77,7 @@ test("filters diary tags split between SSE events and UTF-8 byte chunks", () => 
     .map(match => JSON.parse(`"${match[1]}"`))
     .join("");
 
-  assert.equal(visibleContent, "公开🙂结束");
+  assert.equal(visibleContent, "公开🙂\n结束");
   assert.deepEqual(diaries, ["私密日记"]);
   assert.ok(!output.includes("私密日记"));
   assert.ok(!output.includes("[DIARY]"));
@@ -65,14 +86,28 @@ test("filters diary tags split between SSE events and UTF-8 byte chunks", () => 
 test("extracts closed diary tags from non-stream chat responses", () => {
   const diaries = [];
   const response = JSON.stringify({
-    choices: [{ message: { role: "assistant", content: "Visible [DIARY]private[/DIARY] tail" } }]
+    choices: [{ message: { role: "assistant", content: "Visible\n[DIARY]private[/DIARY] tail" } }]
   });
 
   const result = filterCompletionResponse(response, content => diaries.push(content));
 
   assert.equal(result.changed, true);
-  assert.equal(JSON.parse(result.responseText).choices[0].message.content, "Visible  tail");
+  assert.equal(JSON.parse(result.responseText).choices[0].message.content, "Visible\n tail");
   assert.deepEqual(diaries, ["private"]);
+});
+
+test("keeps inline diary tags unchanged in non-stream responses", () => {
+  const diaries = [];
+  const content = "Visible [DIARY]ordinary mention[/DIARY] tail";
+  const response = JSON.stringify({
+    choices: [{ message: { role: "assistant", content } }]
+  });
+
+  const result = filterCompletionResponse(response, entry => diaries.push(entry));
+
+  assert.equal(result.changed, false);
+  assert.equal(result.responseText, response);
+  assert.deepEqual(diaries, []);
 });
 
 test("keeps non-diary non-stream responses byte-for-byte unchanged", () => {
