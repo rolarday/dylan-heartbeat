@@ -180,12 +180,49 @@ function parseCompletionResponseText(text, contentType = "") {
 function getReadDiaryToolCalls(completion) {
   const calls = completion?.choices?.[0]?.message?.tool_calls;
   if (!Array.isArray(calls) || calls.length === 0) return null;
-  if (!calls.every(call =>
-    call?.function?.name === READ_DIARY_TOOL.function.name &&
-    typeof call.id === "string" &&
-    call.id.length > 0
-  )) return null;
-  return calls;
+  const diaryCalls = calls.filter(call =>
+    call?.function?.name === READ_DIARY_TOOL.function.name
+  );
+  return diaryCalls.length > 0 ? diaryCalls : null;
+}
+
+function getExternalToolCalls(completion) {
+  const calls = completion?.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(calls)) return [];
+  return calls.filter(call =>
+    call?.function?.name !== READ_DIARY_TOOL.function.name
+  );
+}
+
+function returnDiaryToolResults(completion, diaryResults) {
+  const message = completion?.choices?.[0]?.message;
+  if (!message) return completion;
+
+  const externalToolCalls = getExternalToolCalls(completion);
+  const diaryText = diaryResults
+    .map(({ date, content }) => `日记 ${date}：\n${content}`)
+    .join("\n\n");
+  const content = [message.content, diaryText].filter(Boolean).join("\n\n");
+  const returnedMessage = { ...message, content };
+
+  if (externalToolCalls.length > 0) {
+    returnedMessage.tool_calls = externalToolCalls;
+  } else {
+    delete returnedMessage.tool_calls;
+  }
+
+  return {
+    ...completion,
+    choices: completion.choices.map((choice, index) =>
+      index === 0
+        ? {
+            ...choice,
+            message: returnedMessage,
+            finish_reason: externalToolCalls.length > 0 ? "tool_calls" : "stop"
+          }
+        : choice
+    )
+  };
 }
 
 function requestUpstream(body, messages, stream) {
@@ -210,11 +247,14 @@ function requestUpstream(body, messages, stream) {
 async function resolveReadDiaryToolCalls(completion, body, messages) {
   let currentCompletion = completion;
   let currentMessages = [...messages];
+  const diaryResults = [];
   const maxToolRounds = 4;
 
   for (let round = 0; round < maxToolRounds; round++) {
     const calls = getReadDiaryToolCalls(currentCompletion);
     if (!calls) return currentCompletion;
+    const externalCalls = getExternalToolCalls(currentCompletion);
+    const roundResults = [];
 
     const assistantMessage = currentCompletion.choices[0].message;
     currentMessages.push(assistantMessage);
@@ -232,13 +272,24 @@ async function resolveReadDiaryToolCalls(completion, body, messages) {
           result = `读取日记失败：${error.message}`;
         }
       }
-      currentMessages.push({
-        role: "tool",
-        tool_call_id: toolCall.id,
-        name: READ_DIARY_TOOL.function.name,
-        content: result
-      });
+      const date = args.date || "无效日期";
+      roundResults.push({ date, content: result });
+      if (typeof toolCall.id === "string" && toolCall.id.length > 0) {
+        currentMessages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          name: READ_DIARY_TOOL.function.name,
+          content: result
+        });
+      }
     }
+
+    if (externalCalls.length > 0 ||
+        calls.some(toolCall => typeof toolCall.id !== "string" || toolCall.id.length === 0)) {
+      return returnDiaryToolResults(currentCompletion, [...diaryResults, ...roundResults]);
+    }
+
+    diaryResults.push(...roundResults);
 
     const response = await requestUpstream(body, currentMessages, false);
     const responseText = await response.text();
@@ -252,7 +303,7 @@ async function resolveReadDiaryToolCalls(completion, body, messages) {
   }
 
   if (getReadDiaryToolCalls(currentCompletion)) {
-    throw new Error(`模型连续调用 read_diary，超过 ${maxToolRounds} 轮限制`);
+    return returnDiaryToolResults(currentCompletion, diaryResults);
   }
   return currentCompletion;
 }
