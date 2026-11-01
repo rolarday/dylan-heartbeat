@@ -3,6 +3,7 @@ require("dotenv").config({ quiet: true });
 const Fastify = require("fastify");
 const fs = require("fs-extra");
 const path = require("path");
+const { StringDecoder } = require("node:string_decoder");
 const {
   PROJECT_DIR,
   ensureDataDir,
@@ -13,6 +14,11 @@ const {
 const { isSpecialEventContent } = require("./special_events");
 const { decideRequestAccess } = require("./network_access");
 const { DiarySseFilter, filterCompletionResponse } = require("./diary_stream");
+const {
+  READ_DIARY_TOOL,
+  parseDiaryToolArguments,
+  readDiary
+} = require("./diary_tool");
 const {
   formatDateTimeInTimeZone,
   resolveTimeZone,
@@ -87,6 +93,374 @@ function appendKelivoDiaryEntry(content) {
   fs.appendFileSync(diaryFile, entry, "utf-8");
   console.log(`已保存 Kelivo 日记：${diaryFile}`);
   return true;
+}
+
+function addReadDiaryTool(tools) {
+  const clientTools = Array.isArray(tools)
+    ? tools.filter(tool => tool?.function?.name !== READ_DIARY_TOOL.function.name)
+    : [];
+  return [...clientTools, READ_DIARY_TOOL];
+}
+
+function parseSseCompletion(text) {
+  const toolCalls = new Map();
+  let content = "";
+  let lastPayload = null;
+  let finishReason = null;
+  let message = null;
+
+  for (const frame of String(text || "").split(/\r\n\r\n|\n\n|\r\r/)) {
+    const data = frame
+      .split(/\r\n|\n|\r/)
+      .filter(line => line.startsWith("data:"))
+      .map(line => line.slice(5).replace(/^ /, ""))
+      .join("\n");
+    if (!data || data === "[DONE]") continue;
+
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (payload?.error) {
+      throw new Error(payload.error.message || JSON.stringify(payload.error));
+    }
+    lastPayload = payload;
+    const choice = payload?.choices?.[0];
+    if (!choice) continue;
+    if (choice.message) message = { ...message, ...choice.message };
+    if (typeof choice.delta?.content === "string") content += choice.delta.content;
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+
+    for (const delta of choice.delta?.tool_calls || []) {
+      const index = Number.isInteger(delta.index) ? delta.index : toolCalls.size;
+      const call = toolCalls.get(index) || {
+        id: "",
+        type: "function",
+        function: { name: "", arguments: "" }
+      };
+      if (delta.id) call.id = delta.id;
+      if (delta.type) call.type = delta.type;
+      if (delta.function?.name) call.function.name += delta.function.name;
+      if (delta.function?.arguments) call.function.arguments += delta.function.arguments;
+      toolCalls.set(index, call);
+    }
+  }
+
+  if (!lastPayload) throw new Error("上游 SSE 响应中没有可读取的 data JSON");
+  const finalMessage = {
+    ...(message || {}),
+    role: message?.role || "assistant",
+    content: message?.content ?? content
+  };
+  if (toolCalls.size > 0) {
+    finalMessage.tool_calls = Array.from(toolCalls.entries())
+      .sort(([indexA], [indexB]) => indexA - indexB)
+      .map(([, call]) => call);
+  }
+  return {
+    ...lastPayload,
+    choices: [{
+      ...(lastPayload?.choices?.[0] || {}),
+      finish_reason: finishReason || lastPayload?.choices?.[0]?.finish_reason,
+      message: finalMessage
+    }]
+  };
+}
+
+function parseCompletionResponseText(text, contentType = "") {
+  const raw = String(text || "");
+  if (/text\/event-stream/i.test(contentType) || /^\s*(?:event:.*\r?\n)?data:/i.test(raw)) {
+    return parseSseCompletion(raw);
+  }
+  return JSON.parse(raw);
+}
+
+function getReadDiaryToolCalls(completion) {
+  const calls = completion?.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(calls) || calls.length === 0) return null;
+  if (!calls.every(call =>
+    call?.function?.name === READ_DIARY_TOOL.function.name &&
+    typeof call.id === "string" &&
+    call.id.length > 0
+  )) return null;
+  return calls;
+}
+
+function requestUpstream(body, messages, stream) {
+  const requestBody = {
+    ...body,
+    tools: addReadDiaryTool(body.tools),
+    messages,
+    stream
+  };
+  if (!stream) delete requestBody.stream_options;
+
+  return fetch(TARGET_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.TARGET_API_KEY}`
+    },
+    body: JSON.stringify(requestBody)
+  });
+}
+
+async function resolveReadDiaryToolCalls(completion, body, messages) {
+  let currentCompletion = completion;
+  let currentMessages = [...messages];
+  const maxToolRounds = 4;
+
+  for (let round = 0; round < maxToolRounds; round++) {
+    const calls = getReadDiaryToolCalls(currentCompletion);
+    if (!calls) return currentCompletion;
+
+    const assistantMessage = currentCompletion.choices[0].message;
+    currentMessages.push(assistantMessage);
+    for (const toolCall of calls) {
+      const args = parseDiaryToolArguments(toolCall.function.arguments);
+      let result;
+      if (args.error) {
+        result = args.error;
+      } else {
+        const today = formatDateTimeInTimeZone(new Date(), TIME_ZONE).slice(0, 10);
+        try {
+          result = readDiary(args.date, DIARY_DIR_PATH, today);
+        } catch (error) {
+          console.error("[Diary] read_diary 读取失败:", error);
+          result = `读取日记失败：${error.message}`;
+        }
+      }
+      currentMessages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        name: READ_DIARY_TOOL.function.name,
+        content: result
+      });
+    }
+
+    const response = await requestUpstream(body, currentMessages, false);
+    const responseText = await response.text();
+    if (!response.ok) {
+      throw new Error(`日记工具后续模型请求失败（HTTP ${response.status}）：${responseText.slice(0, 300)}`);
+    }
+    currentCompletion = parseCompletionResponseText(
+      responseText,
+      response.headers.get("content-type") || ""
+    );
+  }
+
+  if (getReadDiaryToolCalls(currentCompletion)) {
+    throw new Error(`模型连续调用 read_diary，超过 ${maxToolRounds} 轮限制`);
+  }
+  return currentCompletion;
+}
+
+function createSseCompletion(completion) {
+  const choice = completion?.choices?.[0] || {};
+  const message = choice.message || { role: "assistant", content: "" };
+  const chunk = {
+    id: completion.id,
+    object: "chat.completion.chunk",
+    created: completion.created,
+    model: completion.model,
+    choices: [{
+      index: choice.index || 0,
+      delta: message,
+      finish_reason: choice.finish_reason || (message.tool_calls?.length ? "tool_calls" : "stop")
+    }]
+  };
+  return `data: ${JSON.stringify(chunk)}\n\ndata: [DONE]\n\n`;
+}
+
+function getSseFrameData(frame) {
+  return frame
+    .split(/\r\n|\n|\r/)
+    .filter(line => line.startsWith("data:"))
+    .map(line => line.slice(5).replace(/^ /, ""))
+    .join("\n");
+}
+
+function collectStreamToolCalls(payload, state) {
+  const choice = payload?.choices?.[0];
+  if (!choice) return;
+  if (typeof choice.delta?.content === "string") state.content += choice.delta.content;
+  if (choice.message) state.message = { ...state.message, ...choice.message };
+  if (choice.finish_reason) state.finishReason = choice.finish_reason;
+
+  for (const delta of choice.delta?.tool_calls || []) {
+    const index = Number.isInteger(delta.index) ? delta.index : state.toolCalls.size;
+    const call = state.toolCalls.get(index) || {
+      id: "",
+      type: "function",
+      function: { name: "", arguments: "" }
+    };
+    if (delta.id) call.id = delta.id;
+    if (delta.type) call.type = delta.type;
+    if (delta.function?.name) call.function.name += delta.function.name;
+    if (delta.function?.arguments) call.function.arguments += delta.function.arguments;
+    state.toolCalls.set(index, call);
+  }
+}
+
+function createCompletionFromStreamState(state, lastPayload) {
+  const message = {
+    ...(state.message || {}),
+    role: state.message?.role || "assistant",
+    content: state.message?.content ?? state.content
+  };
+  if (state.toolCalls.size > 0) {
+    message.tool_calls = Array.from(state.toolCalls.entries())
+      .sort(([indexA], [indexB]) => indexA - indexB)
+      .map(([, call]) => call);
+  }
+  return {
+    ...lastPayload,
+    choices: [{
+      ...(lastPayload?.choices?.[0] || {}),
+      finish_reason: state.finishReason || lastPayload?.choices?.[0]?.finish_reason,
+      message
+    }]
+  };
+}
+
+function writeSseHeaders(reply, statusCode) {
+  reply.raw.writeHead(statusCode, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive"
+  });
+}
+
+async function relaySseResponse(response, reply, initialChunks = [], existingReader = null) {
+  writeSseHeaders(reply, response.status);
+  const filter = new DiarySseFilter(appendKelivoDiaryEntry);
+  for (const chunk of initialChunks) {
+    const filteredChunk = filter.push(chunk);
+    if (filteredChunk) reply.raw.write(filteredChunk);
+  }
+
+  if (existingReader || response.body) {
+    const reader = existingReader || response.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const filteredChunk = filter.push(value);
+      if (filteredChunk) reply.raw.write(filteredChunk);
+    }
+  }
+
+  const finalChunk = filter.finish();
+  if (finalChunk) reply.raw.write(finalChunk);
+  reply.raw.end();
+}
+
+async function handleStreamingUpstreamResponse(response, reply, body, messages) {
+  const contentType = response.headers.get("content-type") || "";
+  if (contentType.includes("text/event-stream") && response.body && !response.ok) {
+    return relaySseResponse(response, reply);
+  }
+  if (!contentType.includes("text/event-stream") || !response.body) {
+    const responseText = await response.text();
+    if (response.ok) {
+      let completion = null;
+      try {
+        completion = JSON.parse(responseText);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+
+      if (getReadDiaryToolCalls(completion)) {
+        completion = await resolveReadDiaryToolCalls(completion, body, messages);
+        const filtered = filterCompletionResponse(
+          JSON.stringify(completion),
+          appendKelivoDiaryEntry
+        );
+        writeSseHeaders(reply, response.status);
+        reply.raw.end(createSseCompletion(JSON.parse(filtered.responseText)));
+        return;
+      }
+    }
+
+    const filtered = filterCompletionResponse(responseText, appendKelivoDiaryEntry);
+    return reply
+      .code(response.status)
+      .header("Content-Type", contentType || "application/json")
+      .send(filtered.responseText);
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new StringDecoder("utf8");
+  const initialChunks = [];
+  const state = {
+    content: "",
+    finishReason: null,
+    message: null,
+    toolCalls: new Map()
+  };
+  let lastPayload = null;
+  let pendingText = "";
+  let passthrough = false;
+
+  const inspectFrame = frame => {
+    const data = getSseFrameData(frame);
+    if (!data || data === "[DONE]") return;
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      return;
+    }
+    if (payload?.error) {
+      passthrough = true;
+      return;
+    }
+
+    lastPayload = payload;
+    collectStreamToolCalls(payload, state);
+    if (state.toolCalls.size === 0 && typeof payload?.choices?.[0]?.delta?.content === "string" &&
+        payload.choices[0].delta.content.length > 0) {
+      passthrough = true;
+    }
+  };
+
+  while (!passthrough) {
+    const { done, value } = await reader.read();
+    if (done) {
+      pendingText += decoder.end();
+      if (pendingText) inspectFrame(pendingText);
+      break;
+    }
+
+    initialChunks.push(Buffer.from(value));
+    pendingText += decoder.write(value);
+    while (true) {
+      const delimiter = /\r\n\r\n|\n\n|\r\r/.exec(pendingText);
+      if (!delimiter) break;
+      const frame = pendingText.slice(0, delimiter.index);
+      pendingText = pendingText.slice(delimiter.index + delimiter[0].length);
+      inspectFrame(frame);
+      if (passthrough) break;
+    }
+  }
+
+  const calls = getReadDiaryToolCalls(createCompletionFromStreamState(state, lastPayload));
+  if (!passthrough && calls) {
+    const completion = createCompletionFromStreamState(state, lastPayload);
+    const resolved = await resolveReadDiaryToolCalls(completion, body, messages);
+    const filtered = filterCompletionResponse(JSON.stringify(resolved), appendKelivoDiaryEntry);
+    writeSseHeaders(reply, response.status);
+    reply.raw.end(createSseCompletion(JSON.parse(filtered.responseText)));
+    return;
+  }
+
+  if (passthrough || !calls) {
+    if (pendingText && initialChunks.length === 0) {
+      initialChunks.push(Buffer.from(pendingText));
+    }
+    return relaySseResponse(response, reply, initialChunks, reader);
+  }
 }
 
 // ========================
@@ -742,7 +1116,11 @@ app.post("/v1/chat/completions", async (req, reply) => {
         "Content-Type": "application/json",
         Authorization: `Bearer ${process.env.TARGET_API_KEY}`
       },
-      body: JSON.stringify({ ...body, messages: llmMessages })
+      body: JSON.stringify({
+        ...body,
+        tools: addReadDiaryTool(body.tools),
+        messages: llmMessages
+      })
     });
 
     const upstreamContentType = response.headers.get("content-type") || "";
@@ -751,6 +1129,27 @@ app.post("/v1/chat/completions", async (req, reply) => {
     // 批注 2026-07-11：Kelivo 关闭 stream 时需要收到普通 JSON；只在请求或上游确认为 SSE 时才按流式直通。
     if (!shouldStreamResponse) {
       const responseText = await response.text();
+      if (response.ok) {
+        let completion = null;
+        try {
+          completion = JSON.parse(responseText);
+        } catch (error) {
+          if (!(error instanceof SyntaxError)) throw error;
+        }
+
+        if (getReadDiaryToolCalls(completion)) {
+          completion = await resolveReadDiaryToolCalls(completion, body, llmMessages);
+          const filtered = filterCompletionResponse(
+            JSON.stringify(completion),
+            appendKelivoDiaryEntry
+          );
+          return reply
+            .code(response.status)
+            .header("Content-Type", upstreamContentType || "application/json")
+            .send(filtered.responseText);
+        }
+      }
+
       const filteredResponse = filterCompletionResponse(responseText, appendKelivoDiaryEntry);
       return reply
         .code(response.status)
@@ -758,27 +1157,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
         .send(filteredResponse.responseText);
     }
 
-    if (!response.body) {
-      return reply.code(response.status).send({ error: "上游 API 没有返回可读取的响应体" });
-    }
-
-    reply.raw.writeHead(response.status, {
-      "Content-Type": upstreamContentType || "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive"
-    });
-
-    const reader = response.body.getReader();
-    const diarySseFilter = new DiarySseFilter(appendKelivoDiaryEntry);
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const filteredChunk = diarySseFilter.push(value);
-      if (filteredChunk) reply.raw.write(filteredChunk);
-    }
-    const finalChunk = diarySseFilter.finish();
-    if (finalChunk) reply.raw.write(finalChunk);
-    reply.raw.end();
+    return handleStreamingUpstreamResponse(response, reply, body, llmMessages);
   } catch (err) {
     console.error(err);
     if (reply.raw.headersSent) {

@@ -461,6 +461,8 @@ diary/YYYY-MM-DD.md
 
 Kelivo 聊天中的日记会追加保存到独立文件 `diary/YYYY-MM-DD.kelivo.md`，不会覆盖自动唤醒日记。Gateway 会在响应转发给 Kelivo 前移除完整的 `[DIARY]...[/DIARY]` 块；未闭合的日记块不会保存，且其内容不会发送给客户端。文件名由服务器生成，模型不能指定保存路径。
 
+Kelivo 主窗口还可以通过 `read_diary(date)` 工具读取指定日期的自动唤醒和 Kelivo 日记。只允许读取今天及之前六天内的 `YYYY-MM-DD` 日期；工具只检查对应日期的固定日记文件，不提供目录列表或任意路径读取，单次返回最多 8000 个字符。
+
 默认开启：
 
 ```env
