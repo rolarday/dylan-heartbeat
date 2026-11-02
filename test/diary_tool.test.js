@@ -10,9 +10,16 @@ const {
   readDiary
 } = require("../diary_tool");
 
-test("defines read_diary with only a date argument", () => {
+test("defines read_diary with date and note arguments", () => {
   assert.equal(READ_DIARY_TOOL.function.name, "read_diary");
-  assert.deepEqual(READ_DIARY_TOOL.function.parameters.required, ["date"]);
+  assert.deepEqual(READ_DIARY_TOOL.function.parameters.anyOf, [
+    { required: ["date"] },
+    { required: ["note"] }
+  ]);
+  assert.deepEqual(READ_DIARY_TOOL.function.parameters.properties.note.oneOf, [
+    { type: "boolean", enum: [true] },
+    { type: "string" }
+  ]);
   assert.equal(READ_DIARY_TOOL.function.parameters.additionalProperties, false);
 });
 
@@ -62,8 +69,56 @@ test("caps the complete response at 8000 Unicode characters", () => {
 
 test("rejects unexpected arguments and reports invalid tool JSON", () => {
   assert.deepEqual(parseDiaryToolArguments('{"date":"2026-10-31"}'), { date: "2026-10-31" });
+  assert.deepEqual(parseDiaryToolArguments('{"note":true}'), { note: true });
+  assert.deepEqual(parseDiaryToolArguments('{"date":"2026-10-31","note":"abc-2026-10-31T12-00-00-000Z.md"}'), {
+    date: "2026-10-31",
+    note: "abc-2026-10-31T12-00-00-000Z.md"
+  });
   assert.match(parseDiaryToolArguments('{"date":"2026-10-31","path":"secret"}').error, /只允许/);
   assert.match(parseDiaryToolArguments("{").error, /合法 JSON/);
+});
+
+test("reads latest or named notes without mixing them into date-based diary results", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "diary-tool-"));
+  const notesDirectory = path.join(directory, "notes");
+  fs.mkdirSync(notesDirectory);
+  const oldFilename = "window-2026-10-30T12-00-00-000Z.md";
+  const newFilename = "window-2026-10-31T12-00-00-000Z.md";
+  try {
+    fs.writeFileSync(path.join(directory, "2026-10-31.md"), "daily diary");
+    fs.writeFileSync(path.join(notesDirectory, oldFilename), "old note");
+    fs.writeFileSync(path.join(notesDirectory, newFilename), "latest note");
+    const oldTime = new Date("2026-10-30T12:00:00Z");
+    const newTime = new Date("2026-10-31T12:00:00Z");
+    fs.utimesSync(path.join(notesDirectory, oldFilename), oldTime, oldTime);
+    fs.utimesSync(path.join(notesDirectory, newFilename), newTime, newTime);
+
+    assert.ok(readDiary("2026-10-31", directory, "2026-10-31").includes("daily diary"));
+    assert.ok(!readDiary("2026-10-31", directory, "2026-10-31").includes("latest note"));
+    assert.equal(readDiary(undefined, directory, "2026-10-31", true), "latest note");
+    assert.equal(readDiary(undefined, directory, "2026-10-31", oldFilename), "old note");
+    assert.match(readDiary(undefined, directory, "2026-10-31", "../outside.md"), /只能指定/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("truncates oversized notes from the end", () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "diary-tool-"));
+  const notesDirectory = path.join(directory, "notes");
+  fs.mkdirSync(notesDirectory);
+  const filename = "window-2026-10-31T12-00-00-000Z.md";
+  try {
+    fs.writeFileSync(path.join(notesDirectory, filename), "old".repeat(5000) + "\n\nLATEST PARAGRAPH");
+
+    const result = readDiary(undefined, directory, "2026-10-31", filename);
+
+    assert.ok(Array.from(result).length <= MAX_DIARY_CHARS);
+    assert.ok(result.startsWith("[便签过长，已截断，以下为末尾内容]"));
+    assert.ok(result.endsWith("LATEST PARAGRAPH"));
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 test("refuses non-file diary entries", () => {

@@ -1,113 +1,89 @@
 const { StringDecoder } = require("node:string_decoder");
 
-const DIARY_START_TAG = "[DIARY]";
-const DIARY_END_TAG = "[/DIARY]";
+const DIARY_START_TAG = "<日记>";
+const DIARY_END_TAG = "<结束日记>";
+const NOTE_START_TAG = "<便签>";
+const NOTE_END_TAG = "<结束便签>";
+const END_TAGS = [DIARY_END_TAG, NOTE_END_TAG];
 
-function trailingTagPrefixLength(text, tag) {
-  const maxLength = Math.min(text.length, tag.length - 1);
-  for (let length = maxLength; length > 0; length--) {
-    if (text.endsWith(tag.slice(0, length))) return length;
-  }
-  return 0;
-}
-
-function createDiaryContentFilter(onDiary) {
-  let inDiary = false;
-  let pendingStart = "";
-  let pendingEnd = "";
-  let diaryContent = "";
-  let lineStart = true;
+function createDiaryContentFilter(onDiary = () => {}, onNote = () => {}, onWarning = () => {}) {
+  let mode = null;
+  let pending = "";
+  let buffer = "";
 
   return {
     push(text) {
-      let input = String(text || "");
+      let input = pending + String(text || "");
+      pending = "";
       let visible = "";
 
       while (input) {
-        if (inDiary) {
-          const diaryInput = pendingEnd + input;
-          pendingEnd = "";
-          const endIndex = diaryInput.indexOf(DIARY_END_TAG);
-          if (endIndex >= 0) {
-            diaryContent += diaryInput.slice(0, endIndex);
-            onDiary(diaryContent);
-            diaryContent = "";
-            input = diaryInput.slice(endIndex + DIARY_END_TAG.length);
-            inDiary = false;
-            lineStart = false;
-            continue;
+        const starts = mode === null
+          ? [[DIARY_START_TAG, "diary"], [NOTE_START_TAG, "note"]]
+          : [];
+        const ends = mode === "diary"
+          ? [[DIARY_END_TAG, "diary"]]
+          : mode === "note"
+            ? [[NOTE_END_TAG, "note"]]
+            : END_TAGS.map(tag => [tag, "unexpected"]);
+        const complete = [...starts, ...ends].find(([tag]) => input.startsWith(tag));
+
+        if (complete) {
+          const [tag, tagMode] = complete;
+          input = input.slice(tag.length);
+          if (tagMode === "unexpected") {
+            onWarning({ type: "unexpected-end", tag });
+          } else if (mode === null) {
+            mode = tagMode;
+            buffer = "";
+          } else {
+            (mode === "diary" ? onDiary : onNote)(buffer);
+            mode = null;
+            buffer = "";
           }
-
-          const suffixLength = trailingTagPrefixLength(diaryInput, DIARY_END_TAG);
-          diaryContent += suffixLength ? diaryInput.slice(0, -suffixLength) : diaryInput;
-          pendingEnd = suffixLength ? diaryInput.slice(-suffixLength) : "";
-          break;
-        }
-
-        if (pendingStart) {
-          const remainingTag = DIARY_START_TAG.slice(pendingStart.length);
-          let matchedLength = 0;
-          while (
-            matchedLength < input.length &&
-            matchedLength < remainingTag.length &&
-            input[matchedLength] === remainingTag[matchedLength]
-          ) {
-            matchedLength++;
-          }
-          pendingStart += input.slice(0, matchedLength);
-          input = input.slice(matchedLength);
-
-          if (pendingStart === DIARY_START_TAG) {
-            pendingStart = "";
-            inDiary = true;
-            diaryContent = "";
-            lineStart = false;
-            continue;
-          }
-          if (matchedLength === remainingTag.length || input.length === 0) break;
-
-          visible += pendingStart;
-          pendingStart = "";
-          lineStart = false;
           continue;
         }
 
-        if (lineStart && input.startsWith(DIARY_START_TAG)) {
-          input = input.slice(DIARY_START_TAG.length);
-          inDiary = true;
-          diaryContent = "";
-          lineStart = false;
-          continue;
-        }
-        if (lineStart && DIARY_START_TAG.startsWith(input)) {
-          pendingStart = input;
+        const candidateTags = [...starts, ...ends].map(([tag]) => tag);
+        const remainingPrefix = candidateTags.find(tag =>
+          tag.startsWith(input) && input.length < tag.length
+        );
+        if (remainingPrefix) {
+          pending = input;
           break;
         }
 
         const character = input[0];
         input = input.slice(1);
-        if (lineStart && character === "[") {
-          pendingStart = character;
-          continue;
-        }
-        visible += character;
-        lineStart = character === "\n" || character === "\r";
+        if (mode === null) visible += character;
+        else buffer += character;
       }
 
       return visible;
     },
     finish() {
-      if (inDiary) {
+      if (mode !== null) {
+        onWarning({ type: "unterminated", mode });
+        mode = null;
+        buffer = "";
         pending = "";
-        diaryContent = "";
         return "";
       }
-      const visible = pendingStart;
-      pendingStart = "";
+      const danglingTagLength = END_TAGS.some(tag => tag.startsWith(pending));
+      if (danglingTagLength && pending) {
+        onWarning({
+          type: "incomplete-end",
+          tag: END_TAGS.find(tag => tag.startsWith(pending))
+        });
+        pending = "";
+        return "";
+      }
+      const visible = pending;
+      pending = "";
       return visible;
     },
     get canBypass() {
-      return !inDiary && !pendingStart;
+      return mode === null && !pending;
     }
   };
 }
@@ -153,12 +129,12 @@ function hasDiaryStartCandidate(frame) {
         continue;
       }
       if (character === "\\") {
-        if (frame.slice(index, index + 6).toLowerCase() === "\\u005b") return true;
+        if (frame.slice(index, index + 6).toLowerCase() === "\\u003c") return true;
         escaped = true;
         continue;
       }
       if (character === '"') break;
-      if (character === "[") return true;
+      if (character === "<") return true;
     }
   }
 
@@ -166,10 +142,12 @@ function hasDiaryStartCandidate(frame) {
 }
 
 class DiarySseFilter {
-  constructor(onDiary) {
+  constructor(onDiary, onNote, onWarning) {
     this.decoder = new StringDecoder("utf8");
     this.buffer = "";
     this.onDiary = onDiary;
+    this.onNote = onNote;
+    this.onWarning = onWarning;
     this.filters = new Map();
     this.finished = false;
   }
@@ -238,7 +216,7 @@ class DiarySseFilter {
 
       let filter = this.filters.get(choiceIndex);
       if (!filter) {
-        filter = createDiaryContentFilter(this.onDiary);
+        filter = createDiaryContentFilter(this.onDiary, this.onNote, this.onWarning);
         this.filters.set(choiceIndex, filter);
       }
       const visibleContent = filter.push(delta.content);
@@ -263,8 +241,14 @@ class DiarySseFilter {
   }
 }
 
-function filterCompletionResponse(responseText, onDiary) {
-  if (!responseText.includes(DIARY_START_TAG) && !responseText.includes(DIARY_END_TAG)) {
+function filterCompletionResponse(responseText, onDiary, onNote, onWarning) {
+  if (
+    !responseText.includes(DIARY_START_TAG) &&
+    !responseText.includes(DIARY_END_TAG) &&
+    !responseText.includes(NOTE_START_TAG) &&
+    !responseText.includes(NOTE_END_TAG) &&
+    !responseText.toLowerCase().includes("\\u003c")
+  ) {
     return { changed: false, responseText };
   }
 
@@ -281,7 +265,7 @@ function filterCompletionResponse(responseText, onDiary) {
     const content = choice?.message?.content;
     if (typeof content !== "string") continue;
 
-    const filter = createDiaryContentFilter(onDiary);
+    const filter = createDiaryContentFilter(onDiary, onNote, onWarning);
     const visibleContent = filter.push(content) + filter.finish();
     if (visibleContent !== content) {
       choice.message.content = visibleContent;

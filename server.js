@@ -60,6 +60,11 @@ const DATA_DIR = ensureDataDir();
 const TIMELINE_FILE = runtimeFile("enhanced_messages.json");
 const TIMESTAMP_DB_FILE = runtimeFile("message_timestamps.json");
 const DIARY_DIR_PATH = runtimeDirectory(process.env.DIARY_DIR || "diary", "diary");
+const NOTE_DIR_PATH = path.join(DIARY_DIR_PATH, "notes");
+const SESSION_STAMP = (() => {
+  const timestamp = new Date();
+  return `${timestamp.toISOString().slice(0, 10).replace(/-/g, "")}-${timestamp.toISOString().slice(11, 16).replace(":", "")}`;
+})();
 // 批注 2026-07-17：管理页保存 .env 后要让 PM2 刷新进程环境；保留原进程名，
 // 只补 --update-env，避免用户改完推送配置却继续运行旧值。
 const DEFAULT_RESTART_COMMAND = "pm2 restart gateway wake-up --update-env";
@@ -94,6 +99,64 @@ function appendKelivoDiaryEntry(content) {
   fs.appendFileSync(diaryFile, entry, "utf-8");
   console.log(`已保存 Kelivo 日记：${diaryFile}`);
   return true;
+}
+
+function getNoteSessionKey(metadata) {
+  if (typeof metadata?.conversation_id !== "string") return SESSION_STAMP;
+  const sanitized = metadata.conversation_id.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 64);
+  return sanitized || SESSION_STAMP;
+}
+
+function findExistingNoteFile(sessionKey) {
+  if (!fs.existsSync(NOTE_DIR_PATH)) return null;
+  const prefix = `${sessionKey}-`;
+  const matches = fs.readdirSync(NOTE_DIR_PATH)
+    .filter(filename => filename.startsWith(prefix) && filename.endsWith(".md"))
+    .map(filename => {
+      const filePath = path.join(NOTE_DIR_PATH, filename);
+      const stat = fs.lstatSync(filePath);
+      return stat.isFile() ? { filePath, modifiedAt: stat.mtimeMs } : null;
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.modifiedAt - left.modifiedAt);
+  return matches[0]?.filePath || null;
+}
+
+function appendKelivoNote(content, metadata) {
+  const cleanContent = String(content || "").trim();
+  if (!cleanContent) return false;
+
+  fs.ensureDirSync(NOTE_DIR_PATH);
+  const sessionKey = getNoteSessionKey(metadata);
+  const timestamp = new Date().toISOString();
+  let noteFile = findExistingNoteFile(sessionKey);
+  let entry;
+
+  if (noteFile) {
+    entry = `\n\n--- 更新 ${timestamp} ---\n\n${cleanContent}\n`;
+  } else {
+    const fileTimestamp = timestamp.replace(/[:.]/g, "-");
+    noteFile = path.join(NOTE_DIR_PATH, `${sessionKey}-${fileTimestamp}.md`);
+    entry = `---\nsource: kelivo\nsession: ${sessionKey}\ncreated: ${timestamp}\n---\n\n${cleanContent}\n`;
+  }
+
+  fs.appendFileSync(noteFile, entry, "utf-8");
+  console.log(`[Note] saved: ${noteFile} (len=${Buffer.byteLength(cleanContent, "utf8")})`);
+  return true;
+}
+
+function createDiaryCallbacks(metadata) {
+  return {
+    onDiary: appendKelivoDiaryEntry,
+    onNote: content => appendKelivoNote(content, metadata),
+    onWarning: warning => {
+      if (warning.mode === "note") {
+        console.warn("[Note] unterminated, discarded");
+      } else if (warning.tag === "<结束便签>") {
+        console.warn("[Note] unmatched end tag, discarded");
+      }
+    }
+  };
 }
 
 function addReadDiaryTool(tools) {
@@ -274,7 +337,7 @@ async function resolveReadDiaryToolCalls(completion, body, messages) {
       } else {
         const today = formatDateTimeInTimeZone(new Date(), TIME_ZONE).slice(0, 10);
         try {
-          result = readDiary(args.date, DIARY_DIR_PATH, today);
+          result = readDiary(args.date, DIARY_DIR_PATH, today, args.note);
         } catch (error) {
           console.error("[Diary] read_diary 读取失败:", error);
           result = `读取日记失败：${error.message}`;
@@ -398,9 +461,19 @@ function writeSseHeaders(reply, statusCode) {
   });
 }
 
-async function relaySseResponse(response, reply, initialChunks = [], existingReader = null) {
+async function relaySseResponse(
+  response,
+  reply,
+  initialChunks = [],
+  existingReader = null,
+  diaryCallbacks
+) {
   writeSseHeaders(reply, response.status);
-  const filter = new DiarySseFilter(appendKelivoDiaryEntry);
+  const filter = new DiarySseFilter(
+    diaryCallbacks.onDiary,
+    diaryCallbacks.onNote,
+    diaryCallbacks.onWarning
+  );
   for (const chunk of initialChunks) {
     const filteredChunk = filter.push(chunk);
     if (filteredChunk) reply.raw.write(filteredChunk);
@@ -422,9 +495,10 @@ async function relaySseResponse(response, reply, initialChunks = [], existingRea
 }
 
 async function handleStreamingUpstreamResponse(response, reply, body, messages) {
+  const diaryCallbacks = createDiaryCallbacks(body?.metadata);
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("text/event-stream") && response.body && !response.ok) {
-    return relaySseResponse(response, reply);
+    return relaySseResponse(response, reply, [], null, diaryCallbacks);
   }
   if (!contentType.includes("text/event-stream") || !response.body) {
     const responseText = await response.text();
@@ -440,7 +514,9 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
         completion = await resolveReadDiaryToolCalls(completion, body, messages);
         const filtered = filterCompletionResponse(
           JSON.stringify(completion),
-          appendKelivoDiaryEntry
+          diaryCallbacks.onDiary,
+          diaryCallbacks.onNote,
+          diaryCallbacks.onWarning
         );
         writeSseHeaders(reply, response.status);
         reply.raw.end(createSseCompletion(JSON.parse(filtered.responseText)));
@@ -448,7 +524,12 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
       }
     }
 
-    const filtered = filterCompletionResponse(responseText, appendKelivoDiaryEntry);
+    const filtered = filterCompletionResponse(
+      responseText,
+      diaryCallbacks.onDiary,
+      diaryCallbacks.onNote,
+      diaryCallbacks.onWarning
+    );
     return reply
       .code(response.status)
       .header("Content-Type", contentType || "application/json")
@@ -515,7 +596,12 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
   if (!passthrough && calls) {
     const completion = createCompletionFromStreamState(state, lastPayload);
     const resolved = await resolveReadDiaryToolCalls(completion, body, messages);
-    const filtered = filterCompletionResponse(JSON.stringify(resolved), appendKelivoDiaryEntry);
+    const filtered = filterCompletionResponse(
+      JSON.stringify(resolved),
+      diaryCallbacks.onDiary,
+      diaryCallbacks.onNote,
+      diaryCallbacks.onWarning
+    );
     writeSseHeaders(reply, response.status);
     reply.raw.end(createSseCompletion(JSON.parse(filtered.responseText)));
     return;
@@ -525,7 +611,7 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
     if (pendingText && initialChunks.length === 0) {
       initialChunks.push(Buffer.from(pendingText));
     }
-    return relaySseResponse(response, reply, initialChunks, reader);
+    return relaySseResponse(response, reply, initialChunks, reader, diaryCallbacks);
   }
 }
 
@@ -1184,6 +1270,7 @@ app.post("/v1/chat/completions", async (req, reply) => {
     }
 
     const requestedStream = body?.stream === true;
+    const diaryCallbacks = createDiaryCallbacks(body?.metadata);
 
     // 请求模型
     const response = await fetch(TARGET_API_URL, {
@@ -1217,7 +1304,9 @@ app.post("/v1/chat/completions", async (req, reply) => {
           completion = await resolveReadDiaryToolCalls(completion, body, llmMessages);
           const filtered = filterCompletionResponse(
             JSON.stringify(completion),
-            appendKelivoDiaryEntry
+            diaryCallbacks.onDiary,
+            diaryCallbacks.onNote,
+            diaryCallbacks.onWarning
           );
           return reply
             .code(response.status)
@@ -1226,7 +1315,12 @@ app.post("/v1/chat/completions", async (req, reply) => {
         }
       }
 
-      const filteredResponse = filterCompletionResponse(responseText, appendKelivoDiaryEntry);
+      const filteredResponse = filterCompletionResponse(
+        responseText,
+        diaryCallbacks.onDiary,
+        diaryCallbacks.onNote,
+        diaryCallbacks.onWarning
+      );
       return reply
         .code(response.status)
         .header("Content-Type", upstreamContentType || "application/json")
