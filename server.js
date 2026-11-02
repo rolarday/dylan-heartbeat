@@ -77,6 +77,7 @@ function configuredModelName() {
 }
 
 function appendKelivoDiaryEntry(content) {
+  console.log(`[Diary] onDiary 回调被调用，内容长度=${Array.from(String(content || "")).length}`);
   if (!readBooleanEnv("DIARY_ENABLED", true)) {
     console.log("Kelivo 输出了日记，但 DIARY_ENABLED=false，本次不保存");
     return false;
@@ -105,6 +106,7 @@ function addReadDiaryTool(tools) {
 function parseSseCompletion(text) {
   const toolCalls = new Map();
   let content = "";
+  let reasoningContent = "";
   let lastPayload = null;
   let finishReason = null;
   let message = null;
@@ -131,6 +133,9 @@ function parseSseCompletion(text) {
     if (!choice) continue;
     if (choice.message) message = { ...message, ...choice.message };
     if (typeof choice.delta?.content === "string") content += choice.delta.content;
+    if (typeof choice.delta?.reasoning_content === "string") {
+      reasoningContent += choice.delta.reasoning_content;
+    }
     if (choice.finish_reason) finishReason = choice.finish_reason;
 
     for (const delta of choice.delta?.tool_calls || []) {
@@ -154,6 +159,9 @@ function parseSseCompletion(text) {
     role: message?.role || "assistant",
     content: message?.content ?? content
   };
+  if (message?.reasoning_content !== undefined || reasoningContent) {
+    finalMessage.reasoning_content = message?.reasoning_content ?? reasoningContent;
+  }
   if (toolCalls.size > 0) {
     finalMessage.tool_calls = Array.from(toolCalls.entries())
       .sort(([indexA], [indexB]) => indexA - indexB)
@@ -337,6 +345,9 @@ function collectStreamToolCalls(payload, state) {
   const choice = payload?.choices?.[0];
   if (!choice) return;
   if (typeof choice.delta?.content === "string") state.content += choice.delta.content;
+  if (typeof choice.delta?.reasoning_content === "string") {
+    state.reasoningContent += choice.delta.reasoning_content;
+  }
   if (choice.message) state.message = { ...state.message, ...choice.message };
   if (choice.finish_reason) state.finishReason = choice.finish_reason;
 
@@ -361,6 +372,9 @@ function createCompletionFromStreamState(state, lastPayload) {
     role: state.message?.role || "assistant",
     content: state.message?.content ?? state.content
   };
+  if (state.message?.reasoning_content !== undefined || state.reasoningContent) {
+    message.reasoning_content = state.message?.reasoning_content ?? state.reasoningContent;
+  }
   if (state.toolCalls.size > 0) {
     message.tool_calls = Array.from(state.toolCalls.entries())
       .sort(([indexA], [indexB]) => indexA - indexB)
@@ -446,6 +460,7 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
   const initialChunks = [];
   const state = {
     content: "",
+    reasoningContent: "",
     finishReason: null,
     message: null,
     toolCalls: new Map()
@@ -1016,7 +1031,6 @@ app.get("/v1/models", async (req, reply) => {
 // Chat Completions
 // ========================
 app.post("/v1/chat/completions", async (req, reply) => {
-  console.log("收到的请求体:", JSON.stringify(req.body, null, 2));
   try {
     const body = req.body;
     // 批注 2026-07-15：公开部署时日志不能默认写入完整上下文；
