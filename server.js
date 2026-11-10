@@ -468,6 +468,20 @@ function getDiaryToolResultText(call) {
   return `${label}：\n${result}`;
 }
 
+function createDiaryToolMessages(calls) {
+  return calls.map(call => {
+    if (typeof call.id !== "string" || call.id.length === 0) {
+      throw new Error("read_diary tool call 缺少有效 id");
+    }
+    return {
+      role: "tool",
+      tool_call_id: call.id,
+      name: READ_DIARY_TOOL.function.name,
+      content: getDiaryToolResultText(call)
+    };
+  });
+}
+
 function collectStreamToolCalls(payload, state) {
   const choice = payload?.choices?.[0];
   if (!choice) return;
@@ -558,11 +572,133 @@ async function relaySseResponse(
   reply.raw.end();
 }
 
-async function handleStreamingUpstreamResponse(response, reply, body, messages) {
+async function relayDiaryFollowupResponse(response, reply, diaryCallbacks) {
+  writeSseHeaders(reply, response.status);
+  const filter = new DiarySseFilter(
+    diaryCallbacks.onDiary,
+    diaryCallbacks.onNote,
+    diaryCallbacks.onWarning
+  );
+  const decoder = new StringDecoder("utf8");
+  const state = {
+    content: "",
+    reasoningContent: "",
+    finishReason: null,
+    message: null,
+    toolCalls: new Map()
+  };
+  const withheldFrames = [];
+  let pendingText = "";
+
+  const writeFiltered = text => {
+    if (!text) return;
+    const filtered = filter.push(Buffer.from(text));
+    if (filtered) reply.raw.write(filtered);
+  };
+
+  const processFrame = (frame, separator) => {
+    const rawFrame = `${frame}${separator}`;
+    const data = getSseFrameData(frame);
+    if (!data || data === "[DONE]") {
+      withheldFrames.push({ type: data === "[DONE]" ? "done" : "raw", rawFrame });
+      return;
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(data);
+    } catch {
+      writeFiltered(rawFrame);
+      return;
+    }
+    if (payload?.error) {
+      writeFiltered(rawFrame);
+      return;
+    }
+
+    collectStreamToolCalls(payload, state);
+    const hasToolCalls = payload?.choices?.some(choice =>
+      Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0
+    );
+    if (hasToolCalls) {
+      withheldFrames.push({ type: "tool_calls", payload });
+      writeFiltered(stripToolCallsFromFrame(payload));
+      return;
+    }
+    if (state.toolCalls.size > 0 &&
+        payload?.choices?.some(choice => choice?.finish_reason)) {
+      withheldFrames.push({ type: "finish", rawFrame });
+      return;
+    }
+    writeFiltered(rawFrame);
+  };
+
+  const reader = response.body.getReader();
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      pendingText += decoder.end();
+      if (pendingText) processFrame(pendingText, "");
+      break;
+    }
+
+    pendingText += decoder.write(value);
+    while (true) {
+      const delimiter = /\r\n\r\n|\n\n|\r\r/.exec(pendingText);
+      if (!delimiter) break;
+      const frame = pendingText.slice(0, delimiter.index);
+      pendingText = pendingText.slice(delimiter.index + delimiter[0].length);
+      processFrame(frame, delimiter[0]);
+    }
+  }
+
+  const calls = Array.from(state.toolCalls.entries())
+    .sort(([indexA], [indexB]) => indexA - indexB);
+  const diaryCalls = calls
+    .filter(([, call]) => isDiaryCall(call))
+    .map(([, call]) => call);
+  const externalIndexes = new Set(
+    calls
+      .filter(([, call]) => !isDiaryCall(call))
+      .map(([index]) => index)
+  );
+
+  if (diaryCalls.length > 0) {
+    for (const withheld of withheldFrames) {
+      if (withheld.type === "tool_calls") {
+        writeFiltered(retainExternalToolCallsFromFrame(withheld.payload, externalIndexes));
+      } else if (externalIndexes.size > 0 && withheld.type === "finish") {
+        writeFiltered(withheld.rawFrame);
+      } else if (externalIndexes.size > 0 && withheld.type === "done") {
+        writeFiltered(withheld.rawFrame);
+      }
+    }
+    if (externalIndexes.size === 0) {
+      writeFiltered(`data: ${JSON.stringify({
+        object: "chat.completion.chunk",
+        choices: [{ index: 0, delta: {}, finish_reason: "stop" }]
+      })}\n\n`);
+      writeFiltered("data: [DONE]\n\n");
+    }
+  } else {
+    for (const withheld of withheldFrames) {
+      writeFiltered(withheld.rawFrame);
+    }
+  }
+
+  const finalChunk = filter.finish();
+  if (finalChunk) reply.raw.write(finalChunk);
+  reply.raw.end();
+}
+
+async function handleStreamingUpstreamResponse(response, reply, body, messages, toolRound = 0) {
   const diaryCallbacks = createDiaryCallbacks(body?.metadata);
   const contentType = response.headers.get("content-type") || "";
   if (contentType.includes("text/event-stream") && response.body && !response.ok) {
     return relaySseResponse(response, reply, [], null, diaryCallbacks);
+  }
+  if (contentType.includes("text/event-stream") && response.body && toolRound > 0) {
+    return relayDiaryFollowupResponse(response, reply, diaryCallbacks);
   }
   if (!contentType.includes("text/event-stream") || !response.body) {
     const responseText = await response.text();
@@ -575,7 +711,42 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
       }
 
       if (getReadDiaryToolCalls(completion)) {
-        completion = await resolveReadDiaryToolCalls(completion, body, messages);
+        const diaryCalls = getReadDiaryToolCalls(completion);
+        if (toolRound === 0) {
+          const assistantMessage = completion.choices[0].message;
+          const followupMessages = [
+            ...messages,
+            assistantMessage,
+            ...createDiaryToolMessages(diaryCalls)
+          ];
+          const followupResponse = await requestUpstream(body, followupMessages, true);
+          return handleStreamingUpstreamResponse(
+            followupResponse,
+            reply,
+            body,
+            followupMessages,
+            toolRound + 1
+          );
+        }
+
+        const externalCalls = getExternalToolCalls(completion);
+        completion = {
+          ...completion,
+          choices: completion.choices.map((choice, index) => {
+            if (index !== 0 || !choice.message) return choice;
+            const message = { ...choice.message };
+            if (externalCalls.length > 0) message.tool_calls = externalCalls;
+            else {
+              delete message.tool_calls;
+              if (!message.content) message.content = "日记读取轮数已达上限，请稍后重试。";
+            }
+            return {
+              ...choice,
+              message,
+              finish_reason: externalCalls.length > 0 ? "tool_calls" : "stop"
+            };
+          })
+        };
         const filtered = filterCompletionResponse(
           JSON.stringify(completion),
           diaryCallbacks.onDiary,
@@ -602,11 +773,6 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
 
   const reader = response.body.getReader();
   const decoder = new StringDecoder("utf8");
-  const diaryFilter = new DiarySseFilter(
-    diaryCallbacks.onDiary,
-    diaryCallbacks.onNote,
-    diaryCallbacks.onWarning
-  );
   const state = {
     content: "",
     reasoningContent: "",
@@ -616,69 +782,28 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
   };
   let lastPayload = null;
   let pendingText = "";
-  let headersWritten = false;
-  const withheldFrames = [];
-
-  const writeFiltered = text => {
-    if (!text) return;
-    if (!headersWritten) {
-      writeSseHeaders(reply, response.status);
-      headersWritten = true;
-    }
-    const filtered = diaryFilter.push(Buffer.from(text));
-    if (filtered) reply.raw.write(filtered);
-  };
-
+  const bufferedChunks = [];
   const inspectFrame = frame => {
     const data = getSseFrameData(frame);
-    const rawFrame = `${frame}\n\n`;
-    if (!data) {
-      writeFiltered(rawFrame);
-      return;
-    }
-    if (data === "[DONE]") {
-      withheldFrames.push({ type: "done", rawFrame });
-      return;
-    }
-
-    let payload;
+    if (!data || data === "[DONE]") return;
     try {
-      payload = JSON.parse(data);
+      const payload = JSON.parse(data);
+      if (payload?.error) return;
+      lastPayload = payload;
+      collectStreamToolCalls(payload, state);
     } catch {
-      writeFiltered(rawFrame);
-      return;
+      // Preserve malformed or non-JSON frames for the normal response relay.
     }
-    if (payload?.error) {
-      writeFiltered(rawFrame);
-      return;
-    }
-
-    lastPayload = payload;
-    collectStreamToolCalls(payload, state);
-
-    const deltaToolCalls = payload?.choices?.some(choice =>
-      Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0
-    );
-    if (deltaToolCalls) {
-      withheldFrames.push({ type: "tool_calls", payload });
-      writeFiltered(stripToolCallsFromFrame(payload));
-      return;
-    }
-
-    if (state.toolCalls.size > 0 &&
-        payload?.choices?.some(choice => choice?.finish_reason)) {
-      withheldFrames.push({ type: "finish", rawFrame });
-      return;
-    }
-
-    writeFiltered(rawFrame);
   };
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) {
       pendingText += decoder.end();
-      if (pendingText) inspectFrame(pendingText);
+      if (pendingText) {
+        bufferedChunks.push(Buffer.from(pendingText));
+        inspectFrame(pendingText);
+      }
       break;
     }
 
@@ -687,6 +812,8 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
       const delimiter = /\r\n\r\n|\n\n|\r\r/.exec(pendingText);
       if (!delimiter) break;
       const frame = pendingText.slice(0, delimiter.index);
+      const frameWithSeparator = `${frame}${delimiter[0]}`;
+      bufferedChunks.push(Buffer.from(frameWithSeparator));
       pendingText = pendingText.slice(delimiter.index + delimiter[0].length);
       inspectFrame(frame);
     }
@@ -703,43 +830,57 @@ async function handleStreamingUpstreamResponse(response, reply, body, messages) 
       .map(([index]) => index)
   );
 
-  if (diaryCalls.length > 0) {
-    const tail = `\n\n${diaryCalls.map(getDiaryToolResultText).join("\n\n")}`;
-    writeFiltered(`data: ${JSON.stringify({
-      id: lastPayload?.id,
-      object: "chat.completion.chunk",
-      created: lastPayload?.created,
-      model: lastPayload?.model,
-      choices: [{ index: 0, delta: { content: tail }, finish_reason: externalToolIndexes.size ? null : "stop" }]
-    })}\n\n`);
-  }
-
-  if (externalToolIndexes.size > 0) {
-    for (const withheld of withheldFrames) {
-      if (withheld.type === "tool_calls") {
-        writeFiltered(retainExternalToolCallsFromFrame(withheld.payload, externalToolIndexes));
-      } else {
-        writeFiltered(withheld.rawFrame);
-      }
-    }
-  } else if (diaryCalls.length === 0) {
-    for (const withheld of withheldFrames) {
-      writeFiltered(withheld.rawFrame);
-    }
-  }
-
-  const finalChunk = diaryFilter.finish();
-  if (finalChunk) {
-    if (!headersWritten) {
-      writeSseHeaders(reply, response.status);
-      headersWritten = true;
-    }
-    reply.raw.write(finalChunk);
-  }
   if (diaryCalls.length > 0 && externalToolIndexes.size === 0) {
-    reply.raw.write("data: [DONE]\n\n");
+    if (toolRound >= 1) {
+      writeSseHeaders(reply, response.status);
+      reply.raw.end(createSseCompletion({
+        choices: [{
+          message: { role: "assistant", content: "日记读取轮数已达上限，请稍后重试。" },
+          finish_reason: "stop"
+        }]
+      }));
+      return;
+    }
+
+    const completion = createCompletionFromStreamState(state, lastPayload);
+    const assistantMessage = completion.choices[0].message;
+    const toolMessages = createDiaryToolMessages(diaryCalls);
+    const followupResponse = await requestUpstream(
+      body,
+      [...messages, assistantMessage, ...toolMessages],
+      true
+    );
+    return handleStreamingUpstreamResponse(
+      followupResponse,
+      reply,
+      body,
+      [...messages, assistantMessage, ...toolMessages],
+      toolRound + 1
+    );
   }
-  reply.raw.end();
+
+  const filteredChunks = externalToolIndexes.size > 0 && diaryCalls.length > 0
+    ? bufferedChunks.map(chunk => {
+        const text = chunk.toString("utf8");
+        const delimiter = /\r\n\r\n|\n\n|\r\r/.exec(text);
+        if (!delimiter) return chunk;
+        const frame = text.slice(0, delimiter.index);
+        const data = getSseFrameData(frame);
+        if (!data || data === "[DONE]") return chunk;
+        try {
+          const payload = JSON.parse(data);
+          const containsToolCalls = payload?.choices?.some(choice =>
+            Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0
+          );
+          if (!containsToolCalls) return chunk;
+          const stripped = retainExternalToolCallsFromFrame(payload, externalToolIndexes);
+          return stripped ? Buffer.from(stripped) : Buffer.alloc(0);
+        } catch {
+          return chunk;
+        }
+      })
+    : bufferedChunks;
+  return relaySseResponse(response, reply, filteredChunks, reader, diaryCallbacks);
 }
 
 // ========================
